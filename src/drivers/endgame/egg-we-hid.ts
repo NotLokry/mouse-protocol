@@ -505,6 +505,23 @@ export class EggWeHidClient {
     waiter.reject(error);
   }
 
+  /**
+   * A stale handle (sleep/resume, USB hiccup) rejects every write until the
+   * device is re-enumerated. Close the command channel, reopen and retry once.
+   */
+  private async sendReportRecovering(channels: WeChannels, data: ArrayBuffer): Promise<void> {
+    try {
+      await channels.cmd.sendFeatureReport(WE_REPORT_ID, data);
+    } catch {
+      await channels.cmd.close().catch(() => undefined);
+      await this.open();
+      const fresh = this.resolvedChannels() ?? channels;
+      fresh.notify.removeEventListener("inputreport", this.onInputReport);
+      fresh.notify.addEventListener("inputreport", this.onInputReport);
+      await fresh.cmd.sendFeatureReport(WE_REPORT_ID, data);
+    }
+  }
+
   private async transact(
     channels: WeChannels,
     command: number,
@@ -529,7 +546,7 @@ export class EggWeHidClient {
     // Ensure ArrayBuffer-backed view for WebHID typings.
     const copy = new Uint8Array(payload);
     try {
-      await channels.cmd.sendFeatureReport(WE_REPORT_ID, copy.buffer);
+      await this.sendReportRecovering(channels, copy.buffer);
     } catch (error) {
       this.failWaiter(error instanceof Error ? error : new Error(String(error)));
     }

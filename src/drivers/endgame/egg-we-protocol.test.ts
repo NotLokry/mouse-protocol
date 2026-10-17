@@ -150,3 +150,32 @@ test("DPI patch refuses corrupt source stages", () => {
   const profile = new Uint8Array(WE_OFF.dpiStages + 4);
   assert.throws(() => wePatchActiveDpi(profile, 800, 0), /checksum is invalid/);
 });
+
+test("a stale command channel is closed, reopened and the OP1we write retried once", async () => {
+  let stale = true;
+  const calls: string[] = [];
+  const device = {
+    vendorId: 0x3367,
+    productId: 0x1962,
+    productName: "OP1we",
+    opened: true,
+    collections: [
+      { usagePage: 0xff02, usage: 0, featureReports: [{ reportId: WE_REPORT_ID, items: [] }], inputReports: [], outputReports: [], children: [] },
+      { usagePage: 0xff01, usage: 0, featureReports: [], inputReports: [{ reportId: 0x09, items: [] }], outputReports: [], children: [] },
+    ],
+    async open() { calls.push("open"); this.opened = true; stale = false; },
+    async close() { calls.push("close"); this.opened = false; },
+    addEventListener() {},
+    removeEventListener() {},
+    async sendFeatureReport() {
+      if (stale) throw new DOMException("Failed to write the feature report.", "NetworkError");
+      calls.push("sent");
+    },
+  } as unknown as HIDDevice;
+  const client = new EggWeHidClient(device);
+  const send = (client as unknown as {
+    sendReportRecovering(channels: { cmd: HIDDevice; notify: HIDDevice }, data: ArrayBuffer): Promise<void>;
+  }).sendReportRecovering.bind(client);
+  await send({ cmd: device, notify: device }, new ArrayBuffer(16));
+  assert.deepEqual(calls, ["close", "open", "sent"]);
+});

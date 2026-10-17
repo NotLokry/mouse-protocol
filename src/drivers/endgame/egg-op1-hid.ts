@@ -637,7 +637,7 @@ export class EggOp1HidClient {
     let lastError: unknown;
     for (let attempt = 0; attempt < 4; attempt += 1) {
       try {
-        await this.device.sendFeatureReport(EGG_REPORT.config, payload);
+        await this.sendFeatureRecovering(EGG_REPORT.config, payload);
         lastError = undefined;
         break;
       } catch (error) {
@@ -715,7 +715,22 @@ export class EggOp1HidClient {
     command.set([operation, ...header]);
     // Payload sits at wire offset 16, i.e. 15 once the report ID is stripped.
     if (payload) command.set(payload, 15);
-    await this.device.sendFeatureReport(EGG_REPORT.command, command);
+    await this.sendFeatureRecovering(EGG_REPORT.command, command);
+  }
+
+  /**
+   * A handle left stale (sleep/resume, USB hiccup, an earlier page) rejects
+   * every write with "Failed to write the feature report" until the device is
+   * re-enumerated. Close and reopen it once and retry before giving up.
+   */
+  private async sendFeatureRecovering(reportId: number, data: BufferSource): Promise<void> {
+    try {
+      await this.device.sendFeatureReport(reportId, data);
+    } catch {
+      await this.device.close().catch(() => undefined);
+      await this.open();
+      await this.device.sendFeatureReport(reportId, data);
+    }
   }
 
   private async pollCommandOk(attempts: number): Promise<boolean> {
