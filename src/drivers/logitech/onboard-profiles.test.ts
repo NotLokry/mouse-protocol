@@ -16,11 +16,21 @@ import {
   decodeLiftOffLevel,
   describeProfileFormat,
   dpiStageCapabilitiesForOptions,
+  isProfileWritable,
+  isLodWritableForProduct,
   encodeDpiStages,
+  encodeButtonAssignment,
+  encodeMacroButtonAssignment,
+  encodeMacroSector,
   encodeProfileName,
+  decodeAnalogButtons,
+  encodeAnalogButtons,
   encodeReportRate,
+  factoryDirectoryForFormat,
   factoryProfileForFormat,
+  isBlankDirectory,
   supportsFactoryReset,
+  reportRateCapabilitiesFor,
   reportRatesFor,
   reportRatesForDevice,
   validateBunnyHoppingMs,
@@ -28,6 +38,7 @@ import {
   validateReportRate,
   PROFILE_NAME_MAX_CHARS,
   validateDpiStagePlan,
+  layoutForFormat,
 } from "./onboard-profiles.ts";
 
 function bytes(hex: string): Uint8Array {
@@ -64,6 +75,36 @@ const SECTOR_3 = bytes(`
   03 00 00 00 00 00 1f 40 00 00 00 03 00 00 00 00
   00 1f 40 00 00 00 03 00 00 00 00 00 1f 40 32 00
   00 03 00 00 00 00 00 1f 40 32 00 00 03 20 c7
+`);
+
+/**
+ * Profile sector 1 from a real PRO X 2 and PRO X 3 Superstrike (format 8; the
+ * two are byte-identical in every captured position), reconstructed
+ * from a user diagnostic's raw 0x0E/0x55 memory reads. Five DPI stages -
+ * 800/1200/1600/2400/3200, all X=Y linked, lift-off byte 2 ("Medium") on
+ * every stage. First hardware confirmation of format 8's DPI table layout
+ * and lift-off range; see the capabilitiesForFormat(8) comment. Seven bytes
+ * (0x1d-0x1f, 0xdc-0xdf) are missing from the diagnostic log, which drops
+ * trailing zero bytes from a reply; they are zeros, and the sector's stored
+ * CRC only matches with them filled that way (see the CRC test below).
+ */
+const SECTOR_1_SUPERSTRIKE = bytes(`
+  03 03 00 00 20 03 20 03 02 b0 04 b0 04 02 40 06
+  40 06 02 60 09 60 09 02 80 0c 80 0c 02 00 00 00
+  00 ff 00 ff ff ff 14 08 0c 14 08 0c 3c 00 2c 01
+  80 01 00 01 80 01 00 02 80 01 00 04 80 01 00 08
+  80 01 00 10 ff ff ff ff ff ff ff ff ff ff ff ff
+  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+  03 00 00 00 00 00 1f 40 00 00 00 03 00 00 00 00
+  00 1f 40 00 00 00 03 00 00 00 00 00 1f 40 32 00
+  00 03 00 00 00 00 00 1f 40 32 00 00 03 2a 38
 `);
 
 /** An untouched factory profile: no name, five default DPI stages. CRC 0x84db. */
@@ -262,10 +303,26 @@ test("parses getOnboardProfilesInfo", () => {
   assert.deepEqual(parseProfilesInfo(INFO_REPLY), {
     memoryModelId: 1,
     profileFormatId: 7,
+    macroFormatId: 1,
     profileCount: 5,
+    buttonCount: 5,
     sectorCount: 16,
     sectorSize: 255,
   });
+});
+
+test("encodes an onboard keyboard macro and links it to a button", () => {
+  const macro = encodeMacroSector(36, [
+    { key: 0x0e, modifiers: 0x03, delayMs: 0 },
+    { key: 0x2c, modifiers: 0, delayMs: 250 },
+  ]);
+  assert.deepEqual([...macro.slice(0, 24)], [
+    0x43, 0x01, 0, 0x43, 0x02, 0, 0x43, 0, 0x0e, 0x44, 0, 0x0e,
+    0x44, 0x02, 0, 0x44, 0x01, 0, 0x40, 0, 250, 0x43, 0, 0x2c,
+  ]);
+  const linked = encodeMacroButtonAssignment(G502_SECTORS[0], 2, "primary", 5, 9);
+  assert.deepEqual([...linked.slice(0x20 + 20, 0x20 + 24)], [0, 5, 9, 0]);
+  assert.equal(profileCrc(linked), storedCrc(linked));
 });
 
 test("parses the profile directory and its enabled flags", () => {
@@ -454,14 +511,18 @@ test("parses the captured G502 format-2 geometry and directory", () => {
   assert.deepEqual(parseProfilesInfo(G502_INFO_REPLY), {
     memoryModelId: 1,
     profileFormatId: 2,
+    macroFormatId: 1,
     profileCount: 3,
+    buttonCount: 11,
     sectorCount: 16,
     sectorSize: 256,
   });
   assert.deepEqual(parseProfilesInfo(G502_HERO_INFO_REPLY), {
     memoryModelId: 1,
     profileFormatId: 2,
+    macroFormatId: 1,
     profileCount: 5,
+    buttonCount: 11,
     sectorCount: 16,
     sectorSize: 256,
   });
@@ -549,12 +610,14 @@ test("decodes all captured G502 LIGHTSPEED format-3 profiles", () => {
 test("parses the captured G502 LIGHTSPEED format-3 geometry and directory", () => {
   assert.deepEqual(
     { verified: describeProfileFormat(3).verified, writable: describeProfileFormat(3).writable },
-    { verified: true, writable: false },
+    { verified: true, writable: true },
   );
   assert.deepEqual(parseProfilesInfo(G502_LIGHTSPEED_INFO_REPLY), {
     memoryModelId: 1,
     profileFormatId: 3,
+    macroFormatId: 1,
     profileCount: 5,
+    buttonCount: 11,
     sectorCount: 16,
     sectorSize: 255,
   });
@@ -566,6 +629,13 @@ test("parses the captured G502 LIGHTSPEED format-3 geometry and directory", () =
     { sector: 4, enabled: false },
     { sector: 5, enabled: false },
   ]);
+});
+
+test("format-3 encoders use the G703-captured scalar grid and shared rate", () => {
+  const capabilities = capabilitiesForFormat(3);
+  assert.deepEqual(capabilities.dpiStages, { maxStages: 5, minDpi: 50, maxDpi: 12000, stepDpi: 50 });
+  assert.deepEqual(reportRatesFor(capabilities.reportRates, "wired"), [125, 250, 500, 1000]);
+  assert.equal(describeProfileFormat(3).writable, true);
 });
 
 test("format-3 probe encoders accept limits collected live from the mouse", () => {
@@ -623,7 +693,9 @@ test("parses the captured G102 LIGHTSYNC format-4 geometry and directory", () =>
   assert.deepEqual(parseProfilesInfo(G102_LIGHTSYNC_INFO_REPLY), {
     memoryModelId: 1,
     profileFormatId: 4,
+    macroFormatId: 1,
     profileCount: 1,
+    buttonCount: 6,
     sectorCount: 16,
     sectorSize: 255,
   });
@@ -659,7 +731,7 @@ test("format-4 encoders prepare reversible scalar DPI, shared-rate and name prob
 
 test("factory reset image is exact, CRC-valid and limited to captured geometry", () => {
   assert.equal(supportsFactoryReset(7), true);
-  for (const format of [1, 2, 3, 4, 5, 6, 8, null, undefined]) {
+  for (const format of [1, 2, 3, 4, 5, 6, null, undefined]) {
     assert.equal(supportsFactoryReset(format), false, `format ${format ?? "missing"}`);
   }
   const factory = factoryProfileForFormat(7, 255);
@@ -667,7 +739,7 @@ test("factory reset image is exact, CRC-valid and limited to captured geometry",
   assert.deepEqual([...factory], [...SECTOR_2]);
   assert.equal(profileCrc(factory), storedCrc(factory));
   assert.equal(factoryProfileForFormat(7, 256), null);
-  assert.equal(factoryProfileForFormat(8, 255), null);
+  assert.equal(factoryProfileForFormat(6, 255), null);
 });
 
 test("factory reset reproduces erased name, bunny-hop and G-Shift regions", () => {
@@ -927,13 +999,18 @@ test("DPI slot limits are per format, not global", () => {
     maxDpi: 4032,
     stepDpi: 84,
   });
-  assert.equal(capabilitiesForFormat(8).dpiStages, null);
+  // Format 8 (Superstrike) is now captured too - see the real-profile decode
+  // test below - and its stages land on format 7's grid, but that is
+  // confirmed, not borrowed.
+  assert.deepEqual(capabilitiesForFormat(8).dpiStages, { maxStages: 5, minDpi: 100, maxDpi: 48000, stepDpi: 50 });
   assert.equal(capabilitiesForFormat(6).dpiStages, null);
   assert.equal(capabilitiesForFormat(null).dpiStages, null);
 
   const stage = { x: 800, y: 800, lod: 1 };
   assert.match(validateDpiStagePlan({ stages: [stage], defaultIndex: 0 }, null) ?? "", /not known/);
-  assert.throws(() => encodeDpiStages(SECTOR_3, 8, { stages: [stage], defaultIndex: 0 }), /not known/);
+  // Format 8's limits are now known (see the real-capture test above);
+  // format 6 (still uncaptured) is the "not known" case here instead.
+  assert.throws(() => encodeDpiStages(SECTOR_3, 6, { stages: [stage], defaultIndex: 0 }), /not known/);
 
   // A hypothetical older format with tighter limits is held to its own.
   const narrow = { maxStages: 2, minDpi: 200, maxDpi: 4000, stepDpi: 100 };
@@ -946,6 +1023,12 @@ test("DPI slot limits are per format, not global", () => {
   assert.equal(clampDpi(9000, narrow), 4000);
   assert.equal(clampDpi(849, narrow), 800);
   assert.equal(clampDpi(Number.NaN, narrow), 200);
+});
+
+test("a legacy format accepts a slot whose lift-off was copied from another slot (G305 slot 3)", () => {
+  const limits = capabilitiesForFormat(3).dpiStages;
+  const stages = [800, 1200, 1600].map((dpi) => ({ x: dpi, y: dpi, lod: 2 }));
+  assert.equal(validateDpiStagePlan({ stages, defaultIndex: 0 }, limits, true), null);
 });
 
 test("unwritable DPI stage plans are rejected before they reach flash", () => {
@@ -970,8 +1053,9 @@ test("lift-off limits come from the profile format, not the model", () => {
   // Format 7 (Pro X Superlight 2) offers all three levels.
   assert.deepEqual(capabilitiesForFormat(7).supportedLods, ["Low", "Medium", "High"]);
 
-  // Format 8 carries the analog-button block, so it is the Superstrike format.
-  assert.deepEqual(capabilitiesForFormat(8).supportedLods, ["Low", "High"]);
+  // Format 8 (Superstrike) - a real captured profile stored lift-off byte 2
+  // ("Medium") on every DPI stage, so it offers all three levels too.
+  assert.deepEqual(capabilitiesForFormat(8).supportedLods, ["Low", "Medium", "High"]);
 
   // The G402 capture did not expose a lift-off setting for format 1.
   assert.deepEqual(capabilitiesForFormat(1).supportedLods, []);
@@ -980,6 +1064,59 @@ test("lift-off limits come from the profile format, not the model", () => {
   assert.deepEqual(capabilitiesForFormat(null).supportedLods, ["Medium", "High"]);
   assert.deepEqual(capabilitiesForFormat(undefined).supportedLods, ["Medium", "High"]);
   assert.deepEqual(capabilitiesForFormat(99).supportedLods, ["Medium", "High"]);
+});
+
+test("the captured format 8 profile matches its own stored CRC", () => {
+  // Full 255-byte sector, checksum included: this is what lets format 8 count
+  // as verified. A CRC-16 match over that many bytes is not a coincidence.
+  assert.equal(profileCrc(SECTOR_1_SUPERSTRIKE), storedCrc(SECTOR_1_SUPERSTRIKE));
+  assert.equal(storedCrc(SECTOR_1_SUPERSTRIKE), 0x2a38);
+  assert.equal(describeProfileFormat(8).verified, true);
+});
+
+test("editing a format 8 DPI stage changes only that stage's DPI and the CRC", () => {
+  const before = decodeOnboardProfile(SECTOR_1_SUPERSTRIKE, 8, { sector: 1, enabled: true }, true);
+  const stages = before.dpiStages.map((stage) => ({ ...stage }));
+  stages[4] = { x: 3000, y: 3000, lod: stages[4].lod };
+  const written = encodeDpiStages(SECTOR_1_SUPERSTRIKE, 8, { stages, defaultIndex: 0 }, undefined, false);
+
+  // A valid checksum, and it round-trips through the decoder.
+  assert.equal(profileCrc(written), storedCrc(written));
+  const after = decodeOnboardProfile(written, 8, { sector: 1, enabled: true }, true);
+  assert.deepEqual(after.dpiStages.map((stage) => stage.x), [800, 1200, 1600, 2400, 3000]);
+  // Lift-off stayed exactly as read on every stage (this call passes writeLod false).
+  assert.deepEqual(after.dpiStages.map((stage) => stage.lod), [2, 2, 2, 2, 2]);
+
+  // Only stage 5's X and Y (0x18-0x1b) and the trailing CRC bytes differ.
+  const changed = [...written.keys()].filter((index) => written[index] !== SECTOR_1_SUPERSTRIKE[index]);
+  assert.deepEqual(changed, [0x18, 0x19, 0x1a, 0x1b, written.length - 2, written.length - 1]);
+});
+
+test("editing a format 8 stage's lift-off changes only that stage's lift-off byte and the CRC", () => {
+  const before = decodeOnboardProfile(SECTOR_1_SUPERSTRIKE, 8, { sector: 1, enabled: true }, true);
+  const stages = before.dpiStages.map((stage) => ({ ...stage }));
+  stages[0] = { ...stages[0], lod: 3 }; // High
+  const written = encodeDpiStages(SECTOR_1_SUPERSTRIKE, 8, { stages, defaultIndex: 0 });
+
+  assert.equal(profileCrc(written), storedCrc(written));
+  const after = decodeOnboardProfile(written, 8, { sector: 1, enabled: true }, true);
+  assert.deepEqual(after.dpiStages.map((stage) => stage.lod), [3, 2, 2, 2, 2]);
+  assert.deepEqual(after.dpiStages.map((stage) => stage.x), [800, 1200, 1600, 2400, 3200]);
+  // Stage 1's lift-off byte (0x08) and the trailing CRC bytes are all that moved.
+  const changed = [...written.keys()].filter((index) => written[index] !== SECTOR_1_SUPERSTRIKE[index]);
+  assert.deepEqual(changed, [0x08, written.length - 2, written.length - 1]);
+});
+
+test("format 8's DPI stages decode from a real PRO X 2 and PRO X 3 Superstrike capture", () => {
+  const decoded = decodeOnboardProfile(SECTOR_1_SUPERSTRIKE, 8, { sector: 1, enabled: true }, true);
+  assert.deepEqual(decoded.dpiStages, [
+    { x: 800, y: 800, lod: 2 },
+    { x: 1200, y: 1200, lod: 2 },
+    { x: 1600, y: 1600, lod: 2 },
+    { x: 2400, y: 2400, lod: 2 },
+    { x: 3200, y: 3200, lod: 2 },
+  ]);
+  assert.equal(decoded.defaultDpiIndex, 0);
 });
 
 test("format 7 counts lift-off levels from one", () => {
@@ -1061,4 +1198,208 @@ test("a corrupted byte invalidates the CRC", () => {
   const tampered = SECTOR_3.slice();
   tampered[0x04] ^= 0xff;
   assert.equal(decodeOnboardProfile(tampered, 7, { sector: 3, enabled: true }, true).crcValid, false);
+});
+
+test("G502 normal and G-Shift button assignments round-trip without touching other records", () => {
+  const normal = encodeButtonAssignment(G502_SECTORS[0], 2, "primary", 5, "DPI Shift");
+  const shifted = encodeButtonAssignment(normal, 2, "g-shift", 5, "Cycle profiles");
+  const decoded = decodeOnboardProfile(shifted, 2, { sector: 1, enabled: true }, false);
+  assert.equal(decoded.buttonAssignments[5]?.action, "DPI Shift");
+  assert.equal(decoded.gShiftAssignments[5]?.action, "Cycle profiles");
+  assert.deepEqual([...shifted.slice(0x20, 0x20 + 5 * 4)], [...G502_SECTORS[0].slice(0x20, 0x20 + 5 * 4)]);
+  assert.equal(decoded.crcValid, true);
+});
+
+test("G502 keyboard shortcuts and consumer keys use direct four-byte HID bindings", () => {
+  const keyboard = encodeButtonAssignment(G502_SECTORS[0], 2, "primary", 5, { kind: "keyboard", modifiers: 0x03, key: 0x0e });
+  assert.deepEqual([...keyboard.slice(0x20 + 5 * 4, 0x20 + 6 * 4)], [0x80, 0x02, 0x03, 0x0e]);
+  const media = encodeButtonAssignment(keyboard, 2, "g-shift", 5, { kind: "consumer", usage: 0x00cd });
+  assert.deepEqual([...media.slice(0x60 + 5 * 4, 0x60 + 6 * 4)], [0x80, 0x03, 0x00, 0xcd]);
+  assert.equal(profileCrc(media), storedCrc(media));
+});
+
+/** Issue #159: a PRO X Wireless (PID 0xc094, main app MPM25.01_B0018). */
+const SUPERLIGHT_C094_INFO_REPLY = bytes("01 0d 00 01 04 01 05 01 05 10 00 ff 0a 04 00 00");
+/** Its sector 1, untouched from the factory, CRC `dd 75` intact. */
+const SUPERLIGHT_C094_SECTOR_1 = (() => {
+  const sector = new Uint8Array(255).fill(0xff);
+  sector.set(bytes("01 00 00 20 03 00 00 00 00 00 00 00 00 ff ff ff"), 0x00);
+  sector.set(bytes("ff 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff"), 0x10);
+  sector.set(bytes("80 01 00 01 80 01 00 02 80 01 00 04 80 01 00 08"), 0x20);
+  sector.set(bytes("80 01 00 10 ff ff ff ff ff ff ff ff ff ff ff ff"), 0x30);
+  sector.set(bytes("00 00 00 00 00 00 1f 40 00 00 00 00 00 00 00 00"), 0xd0);
+  sector.set(bytes("00 1f 40 00 00 00 ff ff ff ff ff ff ff ff ff ff"), 0xe0);
+  sector.set(bytes("ff ff ff ff ff ff ff ff ff ff ff ff ff dd 75"), 0xf0);
+  return sector;
+})();
+
+test("the PRO X Wireless (0xc094) reports format 4, a base-v1 scalar table", () => {
+  // Issue #159: this exact PID was assumed to be format 7 like the Superlight
+  // 2, but a real dump reports format 4 — v1 storage, no per-stage lift-off.
+  assert.deepEqual(parseProfilesInfo(SUPERLIGHT_C094_INFO_REPLY), {
+    memoryModelId: 1,
+    profileFormatId: 4,
+    macroFormatId: 1,
+    profileCount: 5,
+    buttonCount: 5,
+    sectorCount: 16,
+    sectorSize: 255,
+  });
+  const profile = decodeOnboardProfile(
+    SUPERLIGHT_C094_SECTOR_1,
+    4,
+    { sector: 1, enabled: true },
+    true,
+  );
+  assert.equal(profile.crcValid, true);
+  assert.equal(profile.reportRateWireless, 1000);
+  assert.deepEqual(profile.dpiStages, [{ x: 800, y: 800, lod: 0 }]);
+  assert.equal(profile.defaultDpiIndex, 0);
+  // There is no lift-off byte in a base-v1 layout, so the format-7 product
+  // guard has nothing to refuse on this device.
+  assert.equal(isLodWritableForProduct(4, 0xc094), true);
+});
+
+test("only the per-stage lift-off byte is refused on the original G Pro X Superlight (PID 0xc094)", () => {
+  // Format 7's DPI-stage triplet layout (x/y/lift-off) was only confirmed
+  // against a Pro X Superlight 2 dump. A 0xc094 was reported to reject the
+  // lift-off byte on hardware (HID++ error 0x05) as if it were that older
+  // board; the dump above shows a 0xc094 actually reports format 4, so the
+  // guard only stays for the case where one ever reports a v6 format.
+  // Everything else format 7 carries stays writable — the guard is scoped to
+  // the one unverified field, not the whole profile.
+  assert.equal(describeProfileFormat(7).writable, true);
+  assert.equal(isProfileWritable(7), true);
+  assert.equal(isLodWritableForProduct(7, 0xc094), false);
+  // Other format-7 devices (e.g. the Superlight 2) are unaffected.
+  assert.equal(isLodWritableForProduct(7, 0xc099), true);
+  assert.equal(isLodWritableForProduct(7, null), true);
+  assert.equal(isLodWritableForProduct(7, undefined), true);
+  // Unwritable formats stay refused regardless of product id.
+  assert.equal(isLodWritableForProduct(6, 0xc099), false);
+  assert.equal(isLodWritableForProduct(null, 0xc099), false);
+  // Format 8 (PRO X 2 / PRO X 3 Superstrike) is writable in the testing phase,
+  // including its per-stage lift-off byte.
+  assert.equal(isProfileWritable(8), true);
+  assert.equal(isLodWritableForProduct(8, 0xc0a9), true);
+  assert.equal(isLodWritableForProduct(8, null), true);
+});
+
+test("encodeDpiStages preserves the existing lift-off byte when writeLod is false", () => {
+  const sector = new Uint8Array(255).fill(0xff);
+  const layout = layoutForFormat(7);
+  const base = layout.dpi! + 2;
+  sector[base + 4] = 0x02; // pre-existing, hardware-set lift-off byte
+  const plan = {
+    defaultIndex: 0,
+    stages: [{ x: 800, y: 800, lod: 1 }],
+  };
+  const encoded = encodeDpiStages(sector, 7, plan, undefined, false);
+  assert.equal(encoded[base], 0x20); // x low byte (800 = 0x0320)
+  assert.equal(encoded[base + 4], 0x02); // lift-off byte left untouched
+});
+
+test("the PRO X 3 Superstrike's cable carries the full rate range; the PRO X 2's stays at 1 kHz", () => {
+  // Same profile format (8), different USB interfaces. A PRO X 3 diagnostic on
+  // the cable advertises every rate through 8000 Hz (0x8061 mask 0x7f).
+  const x3 = reportRateCapabilitiesFor(8, "C0A9");
+  assert.deepEqual(x3, { wirelessMaxHz: 8000, wiredMaxHz: 8000 });
+  assert.deepEqual(reportRatesFor(x3, "wired"), [125, 250, 500, 1000, 2000, 4000, 8000]);
+  assert.equal(reportRateCapabilitiesFor(8, "c0a9")?.wiredMaxHz, 8000, "the transport id is case-insensitive");
+
+  const x2 = reportRateCapabilitiesFor(8, "C0A8");
+  assert.deepEqual(x2, { wirelessMaxHz: 8000, wiredMaxHz: 1000 });
+  assert.deepEqual(reportRatesFor(x2, "wired"), [125, 250, 500, 1000]);
+  assert.deepEqual(reportRatesFor(x2, "wireless"), [125, 250, 500, 1000, 2000, 4000, 8000]);
+});
+
+test("an unknown or unreported USB transport id keeps the format's own ceilings", () => {
+  assert.deepEqual(reportRateCapabilitiesFor(8, null), capabilitiesForFormat(8).reportRates);
+  assert.deepEqual(reportRateCapabilitiesFor(8, undefined), capabilitiesForFormat(8).reportRates);
+  assert.deepEqual(reportRateCapabilitiesFor(8, "FFFF"), capabilitiesForFormat(8).reportRates);
+  // A format whose ceilings were never captured stays unknown, whatever the id.
+  assert.equal(reportRateCapabilitiesFor(6, "C0A9"), null);
+  assert.equal(reportRateCapabilitiesFor(null, "C0A9"), null);
+});
+
+test("an 8000 Hz cable rate encodes for the PRO X 3 only, touching just that byte and the CRC", () => {
+  const x3 = reportRateCapabilitiesFor(8, "C0A9");
+  const written = encodeReportRate(SECTOR_1_SUPERSTRIKE, 8, "wired", 8000, x3);
+  const offset = layoutForFormat(8).reportRateWired!;
+  assert.equal(written[offset], 6, "8000 Hz is the last entry of the rate table");
+  assert.equal(profileCrc(written), storedCrc(written));
+  const changed = [...written.keys()].filter((index) => written[index] !== SECTOR_1_SUPERSTRIKE[index]);
+  assert.deepEqual(changed, [offset, written.length - 2, written.length - 1]);
+
+  // The PRO X 2's cable, and a caller that names no override, still refuse it.
+  assert.throws(() => encodeReportRate(SECTOR_1_SUPERSTRIKE, 8, "wired", 8000, reportRateCapabilitiesFor(8, "C0A8")));
+  assert.throws(() => encodeReportRate(SECTOR_1_SUPERSTRIKE, 8, "wired", 8000));
+});
+
+test("the stored HITS block reads back as the live values the mouse reports", () => {
+  // Bytes 0x26-0x2b of a real PRO X 3 Superstrike profile: 14 08 0c | 14 08 0c,
+  // i.e. actuation 5, sensitivity 2 with rapid trigger off, haptics 3, twice.
+  const stored = { actuation: 5, rapidTrigger: 2, haptics: 3, rapidTriggerEnabled: false };
+  assert.deepEqual(decodeAnalogButtons(SECTOR_1_SUPERSTRIKE, 8), [stored, stored]);
+  assert.equal(decodeAnalogButtons(SECTOR_1_SUPERSTRIKE, 7), null, "only format 8 and up carries the block");
+});
+
+test("saving HITS into a format 8 profile changes only those bytes and the CRC", () => {
+  // What a Both-buttons apply of actuation 8 / haptics 2 would store.
+  const values = { actuation: 8, rapidTrigger: 2, haptics: 2, rapidTriggerEnabled: false };
+  const written = encodeAnalogButtons(SECTOR_1_SUPERSTRIKE, 8, [{ button: 0, ...values }, { button: 1, ...values }]);
+  assert.equal(profileCrc(written), storedCrc(written));
+  assert.deepEqual(decodeAnalogButtons(written, 8), [values, values]);
+  const changed = [...written.keys()].filter((index) => written[index] !== SECTOR_1_SUPERSTRIKE[index]);
+  // 0x26 / 0x29 actuation, 0x28 / 0x2b haptics; the rapid-trigger bytes were already 0x08.
+  assert.deepEqual(changed, [0x26, 0x28, 0x29, 0x2b, written.length - 2, written.length - 1]);
+});
+
+test("HITS in the profile: one button at a time, the on/off bit, and the checks", () => {
+  // Only the right button changes; the left keeps its stored values.
+  const rightOnly = encodeAnalogButtons(SECTOR_1_SUPERSTRIKE, 8, [
+    { button: 1, actuation: 5, rapidTrigger: 3, haptics: 4, rapidTriggerEnabled: true },
+  ]);
+  assert.deepEqual(decodeAnalogButtons(rightOnly, 8), [
+    { actuation: 5, rapidTrigger: 2, haptics: 3, rapidTriggerEnabled: false },
+    { actuation: 5, rapidTrigger: 3, haptics: 4, rapidTriggerEnabled: true },
+  ]);
+  assert.equal(rightOnly[0x2a], 0x0d, "sensitivity 3 with the switch on, as G HUB writes it");
+
+  // Naming no state keeps the stored on/off bit, in either direction.
+  assert.equal(encodeAnalogButtons(rightOnly, 8, [{ button: 1, actuation: 5, rapidTrigger: 4, haptics: 4 }])[0x2a], 0x11);
+  assert.equal(encodeAnalogButtons(SECTOR_1_SUPERSTRIKE, 8, [{ button: 0, actuation: 5, rapidTrigger: 4, haptics: 3 }])[0x27], 0x10);
+
+  assert.throws(() => encodeAnalogButtons(SECTOR_1_SUPERSTRIKE, 7, [{ button: 0, actuation: 5, rapidTrigger: 2, haptics: 3 }]), /no analog button/);
+  assert.throws(() => encodeAnalogButtons(SECTOR_1_SUPERSTRIKE, 8, [{ button: 2, actuation: 5, rapidTrigger: 2, haptics: 3 }]), /left and right/);
+  assert.throws(() => encodeAnalogButtons(SECTOR_1_SUPERSTRIKE, 8, [{ button: 0, actuation: 64, rapidTrigger: 2, haptics: 3 }]), /outside/);
+});
+
+test("format 8 factory sector is the captured G HUB reset image", () => {
+  assert.equal(supportsFactoryReset(8), true);
+  const factory = factoryProfileForFormat(8, 255);
+  assert.ok(factory);
+  assert.deepEqual([...factory], [...SECTOR_1_SUPERSTRIKE]);
+  assert.equal(profileCrc(factory), storedCrc(factory));
+  assert.equal(storedCrc(factory), 0x2a38);
+  assert.equal(factoryProfileForFormat(8, 256), null);
+});
+
+test("format 8 factory directory lists sectors 1 to 5 with only the first enabled, CRC 0x4037", () => {
+  const directory = factoryDirectoryForFormat(8, 255);
+  assert.ok(directory);
+  assert.equal(directory.length, 255);
+  assert.equal(profileCrc(directory), storedCrc(directory));
+  assert.equal(storedCrc(directory), 0x4037);
+  assert.deepEqual([...directory.slice(0, 24)], [0, 1, 1, 255, 0, 2, 0, 255, 0, 3, 0, 255, 0, 4, 0, 255, 0, 5, 0, 255, 255, 255, 255, 255]);
+  assert.deepEqual(parseDirectory(directory).map((entry) => [entry.sector, entry.enabled]), [[1, true], [2, false], [3, false], [4, false], [5, false]]);
+  assert.equal(factoryDirectoryForFormat(7, 255), null, "only captured for format 8");
+  assert.equal(factoryDirectoryForFormat(8, 256), null);
+});
+
+test("a directory is blank only when it lists no profiles", () => {
+  assert.equal(isBlankDirectory(new Uint8Array(255).fill(0xff)), true);
+  assert.equal(isBlankDirectory(new Uint8Array(255)), true);
+  assert.equal(isBlankDirectory(factoryDirectoryForFormat(8, 255)!), false);
+  assert.equal(isBlankDirectory(new Uint8Array(2)), false, "a short read is not proof of blank");
 });

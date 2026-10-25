@@ -3,6 +3,8 @@
  * Drivers added in a PR should set only the flags they need so the shell
  * stays free of brand-specific branching.
  */
+import type { AtkDeviceFeatures } from "./atk/device-catalog.generated.js";
+
 export interface MouseUiHints {
   /** Stable driver id, e.g. "egg-we". */
   family?: string;
@@ -42,10 +44,39 @@ export interface MouseUiHints {
   showAdvancedSection?: boolean;
   /** Always show battery column (even wired with null %). */
   forceShowBattery?: boolean;
+  /** Group the device's battery, DPI-indicator, and sleep controls on Overview. */
+  powerOverview?: boolean;
+  /**
+   * Extra sentence appended to the connected status line, for drivers whose
+   * connection is deliberately limited (e.g. why settings are unavailable).
+   */
+  statusNote?: string;
   /** Override the polling-rate footnote. */
   pollingNote?: string;
   /** Sidebar name before first status read. */
   defaultDisplayName?: string;
+  /**
+   * Simple multi-stage DPI editor in the Sensitivity card (single-axis stages).
+   * Distinct from Logitech onboard slots and Endgame CPI tiles. When set with
+   * `dpiStages` on the status, the shared stage list is shown.
+   */
+  dpiStageEditor?: {
+    /** Highest number of stages the mouse can enable. */
+    maxStages: number;
+    /** When false, stage count is fixed and the count picker is hidden. */
+    countEditable?: boolean;
+    minDpi: number;
+    maxDpi: number;
+    stepDpi: number;
+  };
+  /** Simple DPI indicator modes normalized as 0 off, 1 steady, 2 breathing. */
+  dpiLighting?: {
+    modes: readonly (0 | 1 | 2)[];
+    brightness: readonly number[];
+    speed: readonly number[];
+    /** Optional DPI-indicator-only sleep values in seconds. */
+    sleepTimeouts?: readonly number[];
+  };
 }
 
 /**
@@ -81,6 +112,10 @@ export interface MouseLighting {
   brightnessLevels?: readonly number[];
   /** True when the mouse cannot report the effect back (Razer effect writes). */
   writeOnly?: boolean;
+  /** Driver-specific per-LED zone id when this is a directly painted RGB cell. */
+  hardwareZoneId?: number;
+  /** Lets the UI group individually painted cells into one physical surface. */
+  group?: string;
 }
 
 export type MouseLightingMode =
@@ -92,11 +127,87 @@ export type MouseLightingMode =
   | "Reactive"
   | "Breathing random"
   | "Breathing single"
-  | "Breathing dual";
+  | "Breathing dual"
+  | "Neon"
+  | "Cycling Flash"
+  | "YOYO Ball"
+  | "Single Flash"
+  | "Breathing Loop";
+
+export interface AtkStoredButton {
+  id: "left" | "right" | "middle" | "back" | "forward" | "bottom";
+  name: string;
+  address: number;
+  keyClass: number;
+  value1: number;
+  value2: number;
+  checksumValid: boolean;
+  action: string;
+  raw: string;
+}
+
+export interface AtkReceiverInfo {
+  online: boolean;
+  status: number;
+  rfId: string;
+  pairingStatus: number | null;
+  pairingSecondsRemaining: number | null;
+}
+
+export interface AsusOmniDevice {
+  productId: number;
+  kind: "mouse" | "keyboard" | "unknown";
+  name: string;
+}
+
+export interface AsusOmniInfo {
+  firmware: string;
+  devices: AsusOmniDevice[];
+}
+
+export interface MagneticButtonStatus {
+  /** Null when the mouse has a single switch type or did not report it. */
+  switchType: "magnetic" | "optical" | null;
+  /** Trigger point, inside `triggerPointRange`. Null when the mouse returned no valid value. */
+  triggerPoint: number | null;
+  /** Release travel. Null when the release follows the trigger point or is unsupported. */
+  releasePoint?: number | null;
+  /** Rapid trigger value, inside `rapidTriggerRange`. Null when unknown. */
+  rapidTrigger: number | null;
+  rapidTriggerEnabled: boolean | null;
+}
+
+export interface MagneticButtonsStatus {
+  /** Left button first, right button second. */
+  buttons: MagneticButtonStatus[];
+  triggerPointRange: { min: number; max: number };
+  releasePointRange?: { min: number; max: number };
+  /** Null when rapid trigger cannot be changed on this connection. */
+  rapidTriggerRange: { min: number; max: number } | null;
+  rapidTriggerUnit: "level" | "ms";
+  /** Whether rapid trigger has its own on/off switch, or is off at its lowest value. */
+  rapidTriggerSwitch: boolean;
+  canChooseSwitchType: boolean;
+  /** Null when the mouse cannot be calibrated on this connection. */
+  calibration: "calibrated" | "needed" | "unknown" | null;
+  /** The mouse streams live press depth (0 to 100) while buttons are pressed. */
+  liveDepth: boolean;
+}
+
+export interface MagneticCalibrationProgress {
+  left: number;
+  right: number;
+  message: string;
+  /** 1-based step out of `steps`. */
+  step: number;
+  steps: number;
+}
 
 export interface MouseStatus {
-  brand: "Logitech" | "Pulsar" | "Endgame Gear" | "WLMouse" | "Lamzu" | "Orbital" | "Razer" | "Teevolution" | "ATK" | "VGN" | "Finalmouse" | "Keychron" | "moddoMOUSE" | "Ninjutso";
+  brand: "RAWM" | "Motospeed" | "Logitech" | "Pulsar" | "Endgame Gear" | "WLMouse" | "G-Wolves" | "Lamzu" | "CRDRAKO" | "Attack Shark" | "LunaFury" | "Vancer" | "Orbital" | "Razer" | "Teevolution" | "ATK" | "VXE" | "VGN" | "VAXEE" | "Finalmouse" | "Keychron" | "moddoMOUSE" | "Ninjutso" | "Zaunkoenig" | "Fantech" | "Wooting" | "WALLHACK" | "SteelSeries" | "Glorious" | "MCHOSE" | "K-snake" | "Noir Gear" | "Lingbao" | "GearHub" | "AJAZZ" | "Corsair" | "Microsoft" | "Dareu" | "Redragon" | "Incott" | "HyperX" | "ASUS" | "Ryunix" | "Delux" | "GravaStar" | "IPI" | "Rapoo" | "Fater" | "Cooler Master" | "AJAZZ" | "Scyrox";
   name: string;
+  /** Optional LunaFury controls, populated only after successful device reads. */
+  lunafury?: import("../lamzu/lunafury.js").LunaFurySettings;
   /** Driver-supplied UI policy (optional; keeps control.ts brand-agnostic). */
   ui?: MouseUiHints;
   batteryPercent: number | null;
@@ -110,25 +221,146 @@ export interface MouseStatus {
     maxActuation: number;
     maxRapidTrigger: number;
     maxHaptics: number;
-    buttons: Array<{ actuation: number; rapidTrigger: number; haptics: number }>;
+    buttons: Array<{
+      actuation: number;
+      rapidTrigger: number;
+      haptics: number;
+      /** Rapid trigger on/off (bit 0 of its byte). Absent when a driver cannot tell. */
+      rapidTriggerEnabled?: boolean;
+    }>;
   };
+  /**
+   * Magnetic (Hall-effect) primary-button settings: where the click registers,
+   * rapid trigger, and whether each button uses its magnetic or optical switch.
+   * Absent on mice without magnetic buttons.
+   */
+  magneticButtons?: MagneticButtonsStatus;
   pollingRateHz: number;
   supportedPollingRates?: number[];
   activeProfile: number | null;
+  /** Number of firmware-managed ATK configuration banks, when readable. */
+  atkProfileCount?: number;
+  /** Lossless, read-only ATK button assignments from the active configuration bank. */
+  atkButtonMappings?: AtkStoredButton[];
+  /** Receiver and pairing telemetry. Pairing controls are intentionally separate. */
+  atkReceiver?: AtkReceiverInfo;
+  /** ROG Omni receiver firmware and paired devices. */
+  asusOmni?: AsusOmniInfo;
+  /**
+   * F1 Ultimate sensor sampling-rate mode: 0 Basic, 1 Shard, 2 Shard MAX.
+   * Null until read; drivers without the 0x00b5 row leave it undefined.
+   */
+  atkSensorMode?: number | null;
+  /**
+   * Scroll-wheel anti-mistouch window in milliseconds (0 = off). Null until
+   * read; undefined on drivers without the system-row field.
+   */
+  atkAntiMistouchMs?: number | null;
+  /**
+   * Dongle LED effect last written (0 off, 1 polling, 2 battery, 3 low
+   * battery). Write-only: no read command is known, so this mirrors the
+   * driver's last write rather than the hardware.
+   */
+  atkDongleLight?: number | null;
+  /**
+   * Vendor catalog capability flags for ATK/VXE mice (e.g. noBottomButton,
+   * noAthleticsMax, supportDpiToggle). Undefined when the model is unlisted.
+   */
+  atkCatalogFeatures?: AtkDeviceFeatures;
+  /**
+   * How many onboard profiles the device exposes, when it has a simple
+   * numbered set the user can switch between (distinct from Logitech's
+   * onboard-profile editor). Set together with a 1-based `activeProfile` and a
+   * `setProfile(index)` method, and the shared profile selector appears.
+   */
+  profileCount?: number;
+  /**
+   * Current button assignments, keyed by physical button name. Set together
+   * with `buttonOptions` and a `setButtonMapping(button, action)` method, and
+   * the shared button remapper appears. Distinct from the Razer and Endgame
+   * fields above, which predate this and carry brand-specific shapes.
+   */
+  buttonMappings?: Record<string, string>;
+  /**
+   * Named power/performance modes a device offers as a single choice, with
+   * `powerMode` holding the current one and a `setPowerMode(name)` method.
+   * Distinct from the boolean `performanceMode` above, which is a switch.
+   */
+  powerModes?: string[];
+  powerMode?: string;
+  /** Names for each onboard profile, when the device stores them. */
+  profileNames?: string[];
+  /** Every action `setButtonMapping` will accept, in display order. */
+  buttonOptions?: string[];
+  /** Button names the device reported in an unknown or macro encoding. */
+  fixedButtons?: string[];
   deviceMode?: "Onboard" | "Host" | "Unknown";
   unitId?: string | null;
   modelId?: string | null;
   transportIds?: Record<string, string>;
   connectionType?: "Wired" | "Wireless";
   connectionDetail?: string;
+  /** Zaunkoenig exposes the USB link mode as part of its packed configuration. */
+  usbSpeed?: "Full" | "High";
+  /** Physical button which sends the primary/left-click action. */
+  primaryButton?: "Left" | "Right";
   dongleLedEnabled?: boolean | null;
   finalmouseDongleLedMode?: number | null;
   finalmouseTournamentScrollMode?: number | null;
   finalmouseTournamentScrollTimeoutMs?: number | null;
+  /** True on Starlight X dongles; false/undefined on Ultralight X. */
+  finalmouseIsSlx?: boolean | null;
+  /** Starlight X click mode per switch: 0 mechanical, 1 TMR analog. */
+  finalmouseClickModeL?: number | null;
+  finalmouseClickModeR?: number | null;
+  /** Starlight X release point per switch: 0 normal, 1 early, 2 late. */
+  finalmouseClickReleaseL?: number | null;
+  finalmouseClickReleaseR?: number | null;
+  /** Starlight X TMR actuation steps in 0.01 mm units (1-40). */
+  finalmouseTmrThrL?: number | null;
+  finalmouseTmrThrR?: number | null;
+  /** Starlight X rapid-trigger sensitivity in µm (150-250). */
+  finalmouseTmrHystL?: number | null;
+  finalmouseTmrHystR?: number | null;
+  /** Starlight X calibrated most-sensitive-point reference in µm. */
+  finalmouseTmrMspL?: number | null;
+  finalmouseTmrMspR?: number | null;
+  /** Starlight X PAW lift-off in millimetres (0.7-2.0). */
+  finalmousePawLodMm?: number | null;
+  /** True when the PAW value came from the custom slider rather than a preset. */
+  finalmousePawLodCustom?: boolean | null;
+  /** Starlight X profile roster size, when readable. */
+  finalmouseProfileCount?: number | null;
+  /** Starlight X active profile as a 0-based index. */
+  finalmouseProfileActive?: number | null;
+  /** Starlight X profile enable bitmask. */
+  finalmouseProfileEnabledMask?: number | null;
+  /** Starlight X profile names by 0-based index. */
+  finalmouseProfileNames?: Record<number, string> | null;
+  /**
+   * Incott's 2.4 GHz receiver LED: 0 connect & polling rate, 1 battery
+   * status, 2 battery warning. A property of the dongle, so it is omitted
+   * entirely over the cable rather than reported as a value the user cannot
+   * act on. Does not fit `dongleLedEnabled`, which is a boolean.
+   */
+  incottReceiverLedMode?: number | null;
+  /**
+   * Incott's "Fire Key" rapid-fire settings: how many clicks a press sends
+   * (1-3) and the gap between them in milliseconds (0-255). Global to the
+   * device — the command carries no button index, so these apply to whichever
+   * button is bound to the rapid-fire action.
+   */
+  incottFireKeyTimes?: number | null;
+  incottFireKeyIntervalMs?: number | null;
   signalStrength?: number | null;
   motionSync?: boolean | null;
-  /** NinjaForce DPI stages, where supported. */
+  /** On-device DPI stages, where supported (Teevolution, Ninjutso, …). */
   dpiStages?: number[];
+  /** Per-stage Y DPI on devices that support independently stored axes. */
+  dpiStagesY?: number[];
+  /** RGB colour for each DPI stage, as lowercase #rrggbb. */
+  dpiStageColors?: string[];
+  /** Active DPI stage index into `dpiStages` (0-based). */
   activeDpiStage?: number;
   ninjutsoSystemMode?: "High Speed" | "Competitive" | "Ultra" | null;
   ninjutsoSystemModes?: Array<"High Speed" | "Competitive" | "Ultra">;
@@ -148,10 +380,60 @@ export interface MouseStatus {
   eggPollingDivider?: number;
   eggMulticlickFilters?: number[];
   eggButtonMappings?: string[];
+  eggGlassMode?: boolean;
+  eggSupportsGlassMode?: boolean;
+  /**
+   * Every shipped Razer control's current state, keyed by control name — the
+   * four cross-assignable `RazerButtonControl`s and the three two-state
+   * `RazerToggleControl`s share one dict, since each family's renderer
+   * iterates its own fixed control list and the two lists share no control
+   * names. Undefined on a model that has not been confirmed to support the
+   * class `0x02` write at all. A control whose reply the driver cannot decode
+   * (a keyboard shortcut, Hypershift data, an index nothing here knows) is
+   * omitted rather than guessed at.
+   */
+  razerButtonMappings?: Record<string, string>;
+  /** Keychron Nape Pro user layer currently running on the device (1–8).
+   * Matches firmware get/set. Undefined when the layer commands were not answered.
+   */
+  napeLayer?: number;
+  /** How many Nape onboard layers VIA reported. Undefined when unread. */
+  napeLayerCount?: number;
   performanceMode?: boolean | null;
+  /**
+   * Long-range / far-distance radio mode: trades battery for link range on
+   * receivers that offer it (ATK calls it Ultra Long Range).
+   */
+  longRangeMode?: boolean | null;
+  hyperMode?: boolean | null;
+  /** Sensor pinned to its highest frame rate (WLmouse "Turbo Mode"). */
+  turboMode?: boolean | null;
+  /** Whether button chords can change mouse settings without the driver. */
+  buttonCombination?: boolean | null;
   sensorMode?: "Eco" | "High" | "Ultra" | null;
   sensorModeStored?: 0 | 1 | null;
   sensorModeEditable?: boolean | null;
+  /**
+   * WALLHACK M-001 sensor scanning mode (function area 116): HIGH is the
+   * default frame rate, ACCEL pins the sensor to high performance at higher
+   * battery cost. Undefined when the mouse did not answer.
+   */
+  sensorScanningMode?: "HIGH" | "ACCEL" | null;
+  /** WALLHACK M-001 DPI acceleration on/off. Needs mouse firmware 57+. */
+  dynamicSensitivityEnabled?: boolean | null;
+  /** WALLHACK M-001 active DPI-acceleration curve. Needs mouse firmware 57+. */
+  dynamicSensitivityMode?: "classic" | "natural" | "jump" | "custom" | null;
+  /** WALLHACK M-001 motion-speed reporting (used to preview curves). */
+  dynamicSensitivitySpeedReporting?: boolean | null;
+  /**
+   * WALLHACK M-001 DPI-acceleration curve tables by mode. Each curve holds
+   * exactly 5 points: speed in sensor counts/ms, gain multiplier. Read on
+   * demand (not with the status poll); null until loaded.
+   */
+  dynamicSensitivityCurves?: Record<
+    "classic" | "natural" | "jump" | "custom",
+    Array<{ speed: number; gain: number }>
+  > | null;
   performanceDuration?: number | null;
   angleTuning?: number | null;
   wheelAcceleration?: boolean | null;
@@ -161,7 +443,31 @@ export interface MouseStatus {
   dpiLedMode?: number | null;
   dpiLedBrightness?: number | null;
   dpiLedSpeed?: number | null;
+  /** DPI-indicator-only sleep timeout in seconds, distinct from mouse sleep. */
+  dpiLedSleepTimeout?: number | null;
   liftOffDistance: "Low" | "Medium" | "High" | null;
+  /**
+   * A single lift-off height the device tunes continuously, for mice whose
+   * firmware exposes a range rather than the three Low/Medium/High stops. The
+   * value and bounds are raw device codes; the millimetre figures are what the
+   * control labels. Drivers that only offer the stops leave this undefined, and
+   * a driver that sets it should still fill `liftOffDistance` with the nearest
+   * stop so anything reading the coarse field keeps working.
+   */
+  liftOffScale?: {
+    value: number;
+    min: number;
+    max: number;
+    millimetres: number;
+    minMillimetres: number;
+    maxMillimetres: number;
+    /**
+     * The height of every code from `min` to `max`, index 0 being `min`, for
+     * scales whose steps are uneven. Left undefined, the heights between the
+     * two ends are interpolated linearly.
+     */
+    millimetresByCode?: number[];
+  } | null;
   /** Explicit LOD choices when a mouse does not support all three common levels. */
   supportedLiftOffDistances?: Array<NonNullable<MouseStatus["liftOffDistance"]>>;
   /**
@@ -183,7 +489,7 @@ export interface MouseStatus {
   /** Logitech onboard profile format (HID++ 0x8100), which selects the layout. */
   onboardProfileFormat?: {
     id: number;
-    name: string;
+    name: string; 
     base: string;
     supported: boolean;
     /** False when the layout comes from vendor code but was never confirmed on hardware. */
@@ -191,9 +497,47 @@ export interface MouseStatus {
     /** False until profile-content writes were applied and restored on hardware. */
     writable: boolean;
   } | null;
+  /** Logitech 0x19B0 haptic strength, 0-100. Null when the device has no haptics. */
+  /**
+   * Logitech 0x2111 byte 0 — the wheel's ratchet mode, the same thing the
+   * button behind the wheel toggles. Not SmartShift on/off.
+   */
+  wheelMode?: "Freespin" | "Ratchet" | null;
+  /**
+   * Logitech 0x2111 byte 1. 255 disables SmartShift; any lower value enables
+   * it and sets how gentle a flick releases the ratchet.
+   */
+  smartShiftThreshold?: number | null;
+  /** Logitech 0x2121 — high-resolution (smooth) scrolling. */
+  hiResScroll?: boolean | null;
+  invertScroll?: boolean | null;
+  supportsInvertScroll?: boolean;
+  /** Live read of whether the wheel is currently ratcheted. */
+  wheelRatchetEngaged?: boolean | null;
+  /** Logitech 0x2150 — the horizontal thumb wheel. */
+  thumbWheelInverted?: boolean | null;
+  supportsThumbWheelInvert?: boolean;
+  /** Logitech 0x0007 — the editable name, distinct from the fixed device name. */
+  friendlyName?: string | null;
+  friendlyNameMaxLength?: number | null;
+  /** Logitech 0x1815 — Easy-Switch slot count, or null without the feature. */
+  hostCount?: number | null;
+  /** Zero-based active slot; the button under the mouse counts from one. */
+  currentHost?: number | null;
+  /** One entry per slot, true when a computer is paired to it. */
+  hostSlotsPaired?: boolean[] | null;
+  hapticIntensity?: number | null;
+  /** Logitech 0x19B0 byte 0 bit 0 — haptic feedback on or off. */
+  hapticEnabled?: boolean | null;
+  /** Logitech 0x19B0 byte 0 bit 1 — the device's own haptic battery saver. */
+  hapticBatterySaving?: boolean | null;
   gamingSurfaceMode?: "On" | "Off" | "Auto" | null;
   lightforceSwitchMode?: "Hybrid" | "Optical" | null;
   /** Razer lighting zones. */
   lighting?: MouseLighting;
+  /** Independently addressable lighting zones. `lighting` remains the first zone for compatibility. */
+  lightingZones?: MouseLighting[];
+  /** Device-side scroll direction, when the firmware stores it. */
+  scrollDirection?: "Forward" | "Reverse" | null;
   firmware: string[];
 }

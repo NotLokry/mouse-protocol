@@ -1,5 +1,9 @@
 import type { MouseStatus } from "../mouse-types.ts";
 import {
+  EGG_4K_DONGLE_PID,
+  EGG_4K_OFFSET,
+  EGG_4K_POLLING_RATES,
+  EGG_4K_V1_POLLING_RATES,
   EGG_BUTTON_ACTION_OPTIONS,
   EGG_COMMAND_SIZE,
   EGG_CONFIG_SIZE,
@@ -9,6 +13,7 @@ import {
   EGG_POLLING_RATES,
   EGG_REPORT,
   EGG_VENDOR_ID,
+  eggBlockWrites,
   eggButtonActionLabel,
   eggButtonControlOffset,
   eggButtonMappingOffset,
@@ -36,7 +41,7 @@ export interface EggOp1Status extends MouseStatus {
   eggCpiMax: number;
   eggCpiStepLow: number;
   eggCpiStepHigh: number;
-  eggPollingDivider: number;
+  eggPollingDivider?: number;
   eggLodIndex: number;
   eggLodOptions: string[];
   eggMulticlickFilters: number[];
@@ -85,8 +90,11 @@ export class EggOp1HidClient {
   private configPayloadLength = EGG_CONFIG_SIZE - 1;
   private commandPayloadLength = EGG_COMMAND_SIZE - 1;
   private firmwareVersion: string | null | undefined;
+  /** False on the shared 4K dongle until the mouse-info reply says which mouse is paired. */
+  private modelKnown: boolean;
 
-  readonly profile: EggDeviceProfile;
+  /** On the shared 4K dongle, switches to the paired mouse's profile once it is identified. */
+  profile: EggDeviceProfile;
   onDeviceChange?: () => void;
 
   private readonly onInputReport = (event: HIDInputReportEvent): void => {
@@ -100,6 +108,7 @@ export class EggOp1HidClient {
   constructor(device: HIDDevice) {
     this.device = device;
     this.profile = eggProfileForPid(device.productId);
+    this.modelKnown = device.productId !== EGG_4K_DONGLE_PID;
   }
 
   static isSupported(device: HIDDevice): boolean {
@@ -108,10 +117,10 @@ export class EggOp1HidClient {
       && this.collectionHasFeatureReport(device.collections, EGG_REPORT.command);
   }
 
-  private static collectionHasFeatureReport(collections: readonly HIDCollectionInfo[], reportId: number): boolean {
-    return collections.some((collection) =>
-      collection.featureReports.some((report) => report.reportId === reportId)
-      || this.collectionHasFeatureReport(collection.children, reportId));
+  private static collectionHasFeatureReport(collections: readonly HIDCollectionInfo[] | undefined | null, reportId: number): boolean {
+    return (collections ?? []).some((collection) =>
+      (collection.featureReports ?? []).some((report) => report.reportId === reportId)
+      || this.collectionHasFeatureReport(collection.children ?? [], reportId));
   }
 
   async open(): Promise<void> {
@@ -123,8 +132,8 @@ export class EggOp1HidClient {
   }
 
   describeCollections(): string {
-    return this.device.collections.map((collection) => {
-      const reports = collection.featureReports.map((report) => `0x${report.reportId.toString(16)}`);
+    return (this.device.collections ?? []).map((collection) => {
+      const reports = (collection.featureReports ?? []).map((report) => `0x${report.reportId.toString(16)}`);
       return `usage 0x${collection.usagePage.toString(16)}:0x${collection.usage.toString(16)} · feature ${reports.join(", ") || "none"}`;
     }).join(" | ") || "No HID collections reported";
   }
@@ -139,6 +148,8 @@ export class EggOp1HidClient {
 
   async readStatus(): Promise<EggOp1Status> {
     const config = await this.readConfig();
+    // Retried on each read until the mouse answers: over the dongle it sleeps quickly.
+    if (!this.modelKnown) await this.run(() => this.identifyPairedMouse()).catch(() => undefined);
     const cpiLevels = Math.min(Math.max(config[EGG_OFFSET.cpiLevels], 1), 4);
     // Firmware does not persist the currently selected runtime stage. Stage 1
     // is the stable representative for the generic DPI readout; the complete
@@ -153,7 +164,7 @@ export class EggOp1HidClient {
     }
     const glassMode = this.profile.lodGlass !== null && config[EGG_OFFSET.glassMode] !== 0;
     const lodOptions = eggLodOptions(this.profile, glassMode);
-    const lodIndex = config[EGG_OFFSET.lod];
+    const lodIndex = config[EGG_OFFSET.lod] - this.lodBase(glassMode);
     const handedBytes = Array.from(config.slice(EGG_OFFSET.handedButton, EGG_OFFSET.handedButton + 6));
     const leftHanded = !eggIsPlainLeftAction(handedBytes) && handedBytes.some(Boolean);
     const buttonActions = EGG_BUTTON_NAMES.map((_, index) =>
@@ -167,7 +178,7 @@ export class EggOp1HidClient {
       dpiY,
       supportsSeparateDpiAxes: true,
       pollingRateHz: this.decodePollingRate(config[EGG_OFFSET.pollingDivider]),
-      supportedPollingRates: [...EGG_POLLING_RATES],
+      supportedPollingRates: this.supportedPollingRates(),
       activeProfile: null,
       connectionType: "Wired",
       connectionDetail: `Wired USB - PID 0x${this.device.productId.toString(16).toUpperCase()} - ${this.profile.sensorFamily.toUpperCase()}`,
@@ -175,7 +186,8 @@ export class EggOp1HidClient {
       angleSnapping: config[EGG_OFFSET.angleSnapping] !== 0,
       rippleControl: config[EGG_OFFSET.rippleControl] !== 0,
       slamclickFilter: (config[EGG_OFFSET.filterFlags] & FILTER.slamclick) !== 0,
-      motionJitterFilter: (config[EGG_OFFSET.filterFlags] & FILTER.motionJitter) !== 0,
+      // Bit 4 is the 4K v1's jitter filter; the 4K v2 tool never writes it.
+      motionJitterFilter: this.is4kV2() ? null : (config[EGG_OFFSET.filterFlags] & FILTER.motionJitter) !== 0,
       leftSpdtMode: this.decodeSpdtMode(config[EGG_OFFSET.firstButton]),
       rightSpdtMode: this.decodeSpdtMode(config[EGG_OFFSET.firstButton + BUTTON_CONFIG_SIZE]),
       eggCpiLevels: cpiLevels,
@@ -187,17 +199,20 @@ export class EggOp1HidClient {
         const offset = EGG_OFFSET.firstCpiSplit + level * 5;
         return { x: eggReadUint16LE(config, offset + 1), y: eggReadUint16LE(config, offset + 3) };
       }),
-      eggPollingDivider: config[EGG_OFFSET.pollingDivider],
+      // The 4K v2 polling byte is a vendor enum, so a free divider does not apply there.
+      eggPollingDivider: this.profile.wireless4k ? undefined : config[EGG_OFFSET.pollingDivider],
       eggLodIndex: lodIndex,
       eggLodOptions: [...lodOptions],
       eggGlassMode: glassMode,
       eggSupportsGlassMode: this.profile.lodGlass !== null,
       eggMotionSyncAt8k: this.profile.motionSyncAt8k,
       eggAngleTuning: this.profile.configFamily === "v2"
-        ? this.decodeInt8(config[EGG_OFFSET.angleTuning])
+        ? this.decodeInt8(config[this.angleTuningOffset()])
         : undefined,
       eggForceMaxFps: this.profile.configFamily === "v2"
-        ? config[EGG_OFFSET.forceMaxFps] !== 0
+        ? this.profile.wireless4k
+          ? (config[EGG_OFFSET.filterFlags] & EGG_4K_OFFSET.forceMaxFpsFlag) !== 0
+          : config[EGG_OFFSET.forceMaxFps] !== 0
         : undefined,
       eggLedLiftOffDisabled: this.profile.configFamily === "v2"
         ? config[EGG_OFFSET.ledLiftOff] === 0
@@ -234,8 +249,14 @@ export class EggOp1HidClient {
     return dpi;
   }
 
+  /** The 4K v2 takes only its vendor enum values; wired 8K models use any 8000 / rate divider. */
+  supportedPollingRates(): number[] {
+    if (this.profile.wireless4k) return [...(this.is4kV2() ? EGG_4K_POLLING_RATES : EGG_4K_V1_POLLING_RATES)];
+    return EGG_POLLING_RATES.filter((rate) => rate <= this.profile.maxPollingHz);
+  }
+
   async setPollingRate(rate: number): Promise<number> {
-    if (!EGG_POLLING_RATES.includes(rate as (typeof EGG_POLLING_RATES)[number])) {
+    if (!this.supportedPollingRates().includes(rate)) {
       throw new Error("Unsupported Endgame Gear 8K polling rate.");
     }
     const divider = 8000 / rate;
@@ -269,16 +290,24 @@ export class EggOp1HidClient {
       if (!Number.isInteger(index) || index < 0 || index >= options.length) {
         throw new Error("Invalid lift-off distance for this mouse and sensor mode.");
       }
-      config[EGG_OFFSET.lod] = index;
+      config[EGG_OFFSET.lod] = index + this.lodBase(glassMode);
     });
-    if (confirmed[EGG_OFFSET.lod] !== index) throw new Error("The mouse did not confirm the requested lift-off distance.");
+    const confirmedGlass = this.profile.lodGlass !== null && confirmed[EGG_OFFSET.glassMode] !== 0;
+    if (confirmed[EGG_OFFSET.lod] - this.lodBase(confirmedGlass) !== index) {
+      throw new Error("The mouse did not confirm the requested lift-off distance.");
+    }
   }
 
   async setGlassMode(enabled: boolean): Promise<void> {
     if (this.profile.lodGlass === null) throw new Error(`${this.profile.name} does not support Glass Mode.`);
     const confirmed = await this.updateConfig((config) => {
+      const wasEnabled = config[EGG_OFFSET.glassMode] !== 0;
+      const lod = config[EGG_OFFSET.lod];
       config[EGG_OFFSET.glassMode] = enabled ? 1 : 0;
-      config[EGG_OFFSET.lod] = 0;
+      if (!this.profile.wireless4k) config[EGG_OFFSET.lod] = 0;
+      // The 4K v2 vendor tool's own rescale between the 0.1 mm and whole-mm LOD scales.
+      else if (enabled && !wasEnabled) config[EGG_OFFSET.lod] = lod < 8 ? 1 : lod <= 10 ? 2 : lod;
+      else if (!enabled && wasEnabled) config[EGG_OFFSET.lod] = lod === 1 ? 3 : lod === 2 ? 10 : lod;
     });
     if ((confirmed[EGG_OFFSET.glassMode] !== 0) !== enabled) {
       throw new Error("The mouse did not confirm Glass Mode.");
@@ -290,15 +319,17 @@ export class EggOp1HidClient {
     if (!Number.isInteger(value) || value < -127 || value > 127) {
       throw new Error("Sensor Angle Tuning must be an integer from -127 to 127.");
     }
-    const confirmed = await this.updateConfig((config) => { config[EGG_OFFSET.angleTuning] = value & 0xff; });
-    if (this.decodeInt8(confirmed[EGG_OFFSET.angleTuning]) !== value) {
+    const offset = this.angleTuningOffset();
+    const confirmed = await this.updateConfig((config) => { config[offset] = value & 0xff; });
+    if (this.decodeInt8(confirmed[offset]) !== value) {
       throw new Error("The mouse did not confirm Sensor Angle Tuning.");
     }
   }
 
   async setForceMaxSensorFps(enabled: boolean): Promise<void> {
     this.assertV2SensorControl("Force max Sensor FPS");
-    await this.setBoolean(EGG_OFFSET.forceMaxFps, enabled, "Force max Sensor FPS");
+    if (this.profile.wireless4k) await this.setFilterFlag(EGG_4K_OFFSET.forceMaxFpsFlag, enabled, "Force max Sensor FPS");
+    else await this.setBoolean(EGG_OFFSET.forceMaxFps, enabled, "Force max Sensor FPS");
   }
 
   async setLedLiftOffDisabled(enabled: boolean): Promise<void> {
@@ -332,6 +363,7 @@ export class EggOp1HidClient {
   }
 
   async setMotionJitterFilter(enabled: boolean): Promise<void> {
+    if (this.is4kV2()) throw new Error(`${this.profile.name} has no motion-jitter filter.`);
     await this.setFilterFlag(FILTER.motionJitter, enabled, "motion-jitter filter");
   }
 
@@ -366,6 +398,7 @@ export class EggOp1HidClient {
   }
 
   async setCustomPollingDivider(divider: number): Promise<void> {
+    if (this.profile.wireless4k) throw new Error(`${this.profile.name} only accepts its listed polling rates.`);
     if (!Number.isInteger(divider) || divider < 1 || divider > 255) throw new Error("Polling divider must be an integer from 1 to 255.");
     const confirmed = await this.updateConfig((config) => {
       if (this.profile.lodGlass !== null && config[EGG_OFFSET.glassMode] !== 0) {
@@ -459,6 +492,19 @@ export class EggOp1HidClient {
     if (this.profile.configFamily !== "v2") throw new Error(`${label} is available only on v2 mice.`);
   }
 
+  private angleTuningOffset(): number {
+    return this.profile.wireless4k ? EGG_4K_OFFSET.angleTuning : EGG_OFFSET.angleTuning;
+  }
+
+  /** 4K v1 LOD, and 4K v2 glass-mode LOD, is stored as whole millimetres, so option 0 (1 mm) is wire value 1. */
+  private lodBase(glassMode: boolean): number {
+    return this.profile.wireless4k && (glassMode || !this.is4kV2()) ? 1 : 0;
+  }
+
+  private is4kV2(): boolean {
+    return this.profile.wireless4k === true && this.profile.configFamily === "v2";
+  }
+
   private decodeInt8(value: number): number {
     return value > 127 ? value - 256 : value;
   }
@@ -541,9 +587,14 @@ export class EggOp1HidClient {
 
   private updateConfig(change: (config: Uint8Array) => void): Promise<Uint8Array> {
     return this.run(async () => {
+      // v1 and v2 share the dongle but encode lift-off and polling differently: never write blind.
+      if (!this.modelKnown) await this.identifyPairedMouse();
+      if (!this.modelKnown) throw new Error("The mouse behind the dongle has not identified itself yet. Move it to wake it, then try again.");
       const config = await this.readConfigRaw();
+      const before = config.slice();
       change(config);
-      await this.writeConfigRaw(config);
+      if (this.profile.wireless4k) await this.writeConfigBlocks(before, config);
+      else await this.writeConfigRaw(config);
       return this.readConfigRaw();
     });
   }
@@ -600,6 +651,22 @@ export class EggOp1HidClient {
     if (!acknowledged) throw new Error("The EGG mouse did not acknowledge the configuration write.");
   }
 
+  /** 4K v1 and v2: send only the blocks that changed, like the vendor tools. Both button chunks go together. */
+  private async writeConfigBlocks(before: Uint8Array, after: Uint8Array): Promise<void> {
+    const glass = this.profile.lodGlass !== null;
+    const old = eggBlockWrites(before, glass);
+    const writes = eggBlockWrites(after, glass);
+    const changed = new Set(writes
+      .filter((write, index) => write.payload.some((byte, i) => byte !== old[index].payload[i]))
+      .map((write) => write.command));
+    for (const write of writes.filter((write) => changed.has(write.command))) {
+      // Header after the command byte: target 0x0F (mouse), declared length, two zero bytes, chunk index.
+      await this.sendCommand(write.command, [0x0f, write.declaredLength, 0, 0, write.chunk], write.payload);
+      await this.delay(150);
+      if (!await this.pollCommandOk(8)) throw new Error("The EGG mouse did not acknowledge the configuration write.");
+    }
+  }
+
   private readFirmware(): Promise<string | null> {
     return this.run(async () => {
       await this.open();
@@ -617,9 +684,37 @@ export class EggOp1HidClient {
     });
   }
 
-  private async sendCommand(operation: number): Promise<void> {
+  /**
+   * The dongle's USB IDs are the same whichever 4K mouse is paired; the
+   * mouse-info reply carries the mouse's own VID/PID at payload +0/+2, and the
+   * profile follows it because v1 and v2 encode lift-off and polling
+   * differently (re/PROTOCOL.md section 12). An unlisted PID keeps the neutral
+   * profile. Leaves modelKnown false while the mouse does not answer.
+   */
+  private async identifyPairedMouse(): Promise<void> {
+    await this.open();
+    await this.sendCommand(EGG_OPERATION.mouseInfo);
+    // The vendor tool's settle and busy back-off (PROTOCOL.md section 2).
+    await this.delay(150);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const reply = (await this.receiveFeature(EGG_REPORT.command, EGG_COMMAND_SIZE, this.commandPayloadLength)).bytes;
+      if (reply[1] === STATUS_OK && eggReadUint16LE(reply, 16) === EGG_VENDOR_ID) {
+        const paired = EGG_DEVICE_PROFILES.get(eggReadUint16LE(reply, 18));
+        if (paired?.wireless4k) this.profile = paired;
+        this.modelKnown = true;
+        return;
+      }
+      // An OK without our VID is the previous command's held reply: the dongle has not relayed the mouse yet.
+      if (reply[1] !== STATUS_BUSY && reply[1] !== STATUS_OK) return;
+      await this.delay(200 * (attempt + 1));
+    }
+  }
+
+  private async sendCommand(operation: number, header: number[] = [], payload?: Uint8Array): Promise<void> {
     const command = new Uint8Array(this.commandPayloadLength);
-    command[0] = operation;
+    command.set([operation, ...header]);
+    // Payload sits at wire offset 16, i.e. 15 once the report ID is stripped.
+    if (payload) command.set(payload, 15);
     await this.device.sendFeatureReport(EGG_REPORT.command, command);
   }
 
@@ -667,15 +762,15 @@ export class EggOp1HidClient {
 
   private featurePayloadLength(reportId: number, fallback: number): number {
     const reports: HIDReportInfo[] = [];
-    const collect = (collections: readonly HIDCollectionInfo[]): void => {
-      for (const collection of collections) {
-        reports.push(...collection.featureReports.filter((report) => report.reportId === reportId));
-        collect(collection.children);
+    const collect = (collections: readonly HIDCollectionInfo[] | undefined | null): void => {
+      for (const collection of collections ?? []) {
+        reports.push(...(collection.featureReports ?? []).filter((report) => report.reportId === reportId));
+        collect(collection.children ?? []);
       }
     };
-    collect(this.device.collections);
+    collect(this.device.collections ?? []);
     for (const report of reports) {
-      const bits = report.items.reduce((sum, item) => sum + item.reportSize * item.reportCount, 0);
+      const bits = (report.items ?? []).reduce((sum, item) => sum + item.reportSize * item.reportCount, 0);
       if (bits > 0) return Math.ceil(bits / 8);
     }
     return fallback;
@@ -683,6 +778,7 @@ export class EggOp1HidClient {
 
   private decodePollingRate(divider: number): number {
     if (!divider) throw new Error("The mouse reported an invalid polling-rate divider.");
+    if (this.profile.wireless4k && divider === EGG_4K_OFFSET.powerSavePolling) return 1000;
     return 8000 / divider;
   }
 

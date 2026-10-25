@@ -28,15 +28,41 @@ import {
   encodeRazerRequest,
   razerChecksum,
   razerReadDpiCommand,
+  razerReadDpiStagesCommand,
   razerSetDpiCommand,
+  razerSetDpiStagesCommand,
   razerSetExtendedPollingCommand,
   razerSetLegacyPollingCommand,
   razerMaxLanding,
   razerSetLiftOffCommand,
   razerSetTrackingDistanceCommand,
   razerEnableAsymmetricLiftOffCommand,
+  razerEnableAsymmetricLiftOffCanonicalCommand,
+  razerEnableSensorCalibrationCommand,
   razerSetLowPowerThresholdCommand,
   razerSetSleepTimeoutCommand,
+  RAZER_BUTTON_CONTROLS,
+  RAZER_BUTTON_CONTROL_LABEL,
+  RAZER_BUTTON_MAPPINGS,
+  RAZER_BUTTON_TRANSACTION_ID,
+  RAZER_LOCKED_BUTTON_CONTROL,
+  RAZER_TOGGLE_CONTROLS,
+  RAZER_TOGGLE_CONTROL_INFO,
+  razerDecodeButtonMapping,
+  razerDecodeToggleControl,
+  razerReadButtonMappingCommand,
+  razerReadToggleControlCommand,
+  razerSetButtonMappingCommand,
+  razerSetToggleControlCommand,
+  RAZER_BACKLIGHT_BRIGHTNESS_READ,
+  RAZER_LED,
+  decodeBacklightBrightness,
+  razerReadExtendedBrightnessCommand,
+  razerSetExtendedBrightnessCommand,
+  razerSetExtendedEffectCommand,
+  razerSetBacklightBrightnessCommand,
+  razerSetStandardEffectCommand,
+  type RazerStandardEffect,
 } from "@openmouse/protocol/razer";
 
 /**
@@ -321,6 +347,52 @@ test("a DPI write reads back through the same storage", () => {
   assert.equal(written[8], read[8]);
 });
 
+test("a DPI stage-table write mirrors the read's fixed payload", () => {
+  const packet = encodeRazerRequest(razerSetDpiStagesCommand(3, [
+    { x: 400, y: 400 },
+    { x: 800, y: 800 },
+    { x: 1600, y: 1600 },
+    { x: 3200, y: 3200 },
+    { x: 6400, y: 6400 },
+  ]));
+
+  assert.equal(packet[5], RAZER_READ.dpiStages.dataSize, "the write length is pinned to the read-back");
+  assert.equal(packet[6], 0x04);
+  assert.equal(packet[7], 0x06);
+  assert.deepEqual([...packet.slice(8, 11)], [0x01, 0x03, 0x05], "storage, 1-based active, count");
+  assert.deepEqual([...packet.slice(11, 18)], [0x00, 0x01, 0x90, 0x01, 0x90, 0x00, 0x00]);
+  assert.deepEqual([...packet.slice(18, 25)], [0x01, 0x03, 0x20, 0x03, 0x20, 0x00, 0x00]);
+  assert.deepEqual([...packet.slice(25, 32)], [0x02, 0x06, 0x40, 0x06, 0x40, 0x00, 0x00]);
+  assert.deepEqual([...packet.slice(32, 39)], [0x03, 0x0c, 0x80, 0x0c, 0x80, 0x00, 0x00]);
+  assert.deepEqual([...packet.slice(39, 46)], [0x04, 0x19, 0x00, 0x19, 0x00, 0x00, 0x00]);
+  assert.equal(packet[88], razerChecksum(packet));
+});
+
+test("the DPI stage-table write clears the high bit of its read", () => {
+  assert.equal(RAZER_WRITE.dpiStages.commandClass, RAZER_READ.dpiStages.commandClass);
+  assert.equal(RAZER_WRITE.dpiStages.commandId, RAZER_READ.dpiStages.commandId & 0x7f);
+  assert.equal(RAZER_WRITE.dpiStages.dataSize, RAZER_READ.dpiStages.dataSize);
+});
+
+test("a short stage table writes zero-padded slots the count byte keeps inert", () => {
+  // The kernel driver always sends the full 38-byte payload; a two-stage table
+  // still declares the read's fixed length, with the unused records left zero.
+  const packet = encodeRazerRequest(razerSetDpiStagesCommand(2, [{ x: 400, y: 400 }, { x: 800, y: 800 }]));
+
+  assert.equal(packet[5], 0x26);
+  assert.deepEqual([...packet.slice(8, 11)], [0x01, 0x02, 0x02]);
+  assert.deepEqual([...packet.slice(11, 18)], [0x00, 0x01, 0x90, 0x01, 0x90, 0x00, 0x00]);
+  assert.deepEqual([...packet.slice(18, 25)], [0x01, 0x03, 0x20, 0x03, 0x20, 0x00, 0x00]);
+  assert.deepEqual([...packet.slice(25, 46)], new Array(21).fill(0), "unused slots stay zero");
+});
+
+test("a DPI stage-table write validates active and stage values", () => {
+  assert.throws(() => razerSetDpiStagesCommand(0, [{ x: 400, y: 400 }]), /Active DPI stage/);
+  assert.throws(() => razerSetDpiStagesCommand(2, [{ x: 400, y: 400 }]), /Active DPI stage/);
+  assert.throws(() => razerSetDpiStagesCommand(3, []), /between 1 and 5/);
+  assert.throws(() => razerSetDpiStagesCommand(1, [{ x: 0x10000, y: 400 }]), /between 0 and 65535/);
+});
+
 test("the V2 generation writes and reads DPI through the no-store byte", () => {
   // OpenRazer's driver groups the DeathAdder V2 family with the no-store DPI
   // path, so both commands must carry 0x00 rather than the storage byte 0x01.
@@ -512,6 +584,27 @@ test("the asymmetric unlock is the same command with setting 04", () => {
   assert.equal(packet[88], razerChecksum(packet));
 });
 
+test("the canonical unlock is the same command with value 00", () => {
+  // The fallback arm for a unit that refuses the 0x01 form: verified on 1.14
+  // only, so it is never the shipped unlock.
+  const packet = encodeRazerRequest(razerEnableAsymmetricLiftOffCanonicalCommand());
+
+  assert.deepEqual([packet[5], packet[6], packet[7]], [0x04, 0x0b, 0x0b]);
+  assert.deepEqual([...packet.slice(8, 12)], [0x00, 0x04, 0x04, 0x00]);
+  assert.equal(packet[88], razerChecksum(packet));
+});
+
+test("the calibration-mode arm carries the sensor selector", () => {
+  // `0x0b`/`0x03` `00 04 01`, sent only as the last-resort arm before a pair
+  // write; the layout is read off the experiment notes, not verified on
+  // hardware, so the bytes are pinned here as the shipped driver sends them.
+  const packet = encodeRazerRequest(razerEnableSensorCalibrationCommand());
+
+  assert.deepEqual([packet[5], packet[6], packet[7]], [0x03, 0x0b, 0x03]);
+  assert.deepEqual([...packet.slice(8, 11)], [0x00, 0x04, 0x01]);
+  assert.equal(packet[88], razerChecksum(packet));
+});
+
 test("serial text stops at the terminator", () => {
   const args = decodeRazerResponse(
     reply("02 1f 00 00 00 16 00 82 50 4d 30 30 30 30 48 30 30 30 30 30 30 30 30 00"),
@@ -519,4 +612,329 @@ test("serial text stops at the terminator", () => {
   );
 
   assert.equal(decodeSerial(args), "PM0000H00000000");
+});
+
+/*
+ * Button-mapping fixtures are Viper V3 Pro (firmware 1.12) captures logged in
+ * BUTTONS-RUNBOOK.md, read with Synapse fully closed. Checksums are re-derived
+ * since only the byte content was recorded, not the checksummed packet.
+ */
+test("button mapping decodes a control's own default action", () => {
+  const args = decodeRazerResponse(
+    reply("02 1f 00 00 00 0a 02 8c 01 04 00 01 01 04 00 00 00 00"),
+    RAZER_READ.buttonMapping,
+  );
+
+  assert.equal(razerDecodeButtonMapping(args), "Mouse Button 4");
+});
+
+test("button mapping decodes Disabled", () => {
+  const args = decodeRazerResponse(
+    reply("02 1f 00 00 00 0a 02 8c 01 04 00 00 00 00 00 00 00 00"),
+    RAZER_READ.buttonMapping,
+  );
+
+  assert.equal(razerDecodeButtonMapping(args), "Disabled");
+});
+
+test("button mapping decodes a physically-confirmed cross-control remap", () => {
+  // Mouse Button 4's slot written with Right Click's index, then Left Click's
+  // index — pressing the physical button right-clicked, then left-clicked.
+  // Not just a changed read-back; see BUTTONS-RUNBOOK.md.
+  const asRightClick = decodeRazerResponse(
+    reply("02 1f 00 00 00 0a 02 8c 01 04 00 01 01 02 00 00 00 00"),
+    RAZER_READ.buttonMapping,
+  );
+  const asLeftClick = decodeRazerResponse(
+    reply("02 1f 00 00 00 0a 02 8c 01 04 00 01 01 01 00 00 00 00"),
+    RAZER_READ.buttonMapping,
+  );
+
+  assert.equal(razerDecodeButtonMapping(asRightClick), "Right Click");
+  assert.equal(razerDecodeButtonMapping(asLeftClick), "Left Click");
+});
+
+test("button mapping decodes Left Click and Right Click's own defaults", () => {
+  const left = decodeRazerResponse(
+    reply("02 1f 00 00 00 0a 02 8c 01 01 01 01 01 01 00 00 00 00"),
+    RAZER_READ.buttonMapping,
+  );
+  const right = decodeRazerResponse(
+    reply("02 1f 00 00 00 0a 02 8c 01 02 01 01 01 02 00 00 00 00"),
+    RAZER_READ.buttonMapping,
+  );
+
+  assert.equal(razerDecodeButtonMapping(left), "Left Click");
+  assert.equal(razerDecodeButtonMapping(right), "Right Click");
+});
+
+test("an unrecognised button-mapping type decodes to null, not a guess", () => {
+  // Type 0x02 has never been captured — this driver has no business claiming
+  // to know what it means.
+  const args = decodeRazerResponse(
+    reply("02 1f 00 00 00 0a 02 8c 01 04 00 02 01 05 00 00 00 00"),
+    RAZER_READ.buttonMapping,
+  );
+
+  assert.equal(razerDecodeButtonMapping(args), null);
+});
+
+test("a button-mapping write matches the packet this driver's own write was physically confirmed with", () => {
+  // Transcribed from writeAndVerify() output: Mouse Button 4 set to Right
+  // Click's index, status 0x02, read-back changed and physically confirmed
+  // by pressing the button. See BUTTONS-RUNBOOK.md.
+  const packet = encodeRazerRequest(razerSetButtonMappingCommand("mouse4", "Right Click"), RAZER_BUTTON_TRANSACTION_ID);
+
+  assert.equal(packet[5], 0x0a);
+  assert.equal(packet[6], 0x02);
+  assert.equal(packet[7], 0x0c);
+  assert.deepEqual([...packet.slice(8, 18)], [0x01, 0x04, 0x00, 0x01, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00]);
+  assert.equal(packet[88], razerChecksum(packet));
+});
+
+test("a button-mapping write clears the high bit of the matching read", () => {
+  assert.equal(RAZER_WRITE.buttonMapping.commandClass, RAZER_READ.buttonMapping.commandClass);
+  assert.equal(RAZER_WRITE.buttonMapping.commandId, RAZER_READ.buttonMapping.commandId & 0x7f);
+});
+
+test("the button write carries its own transaction id, not the shared default", () => {
+  // Confirmed on hardware: RAZER_TRANSACTION_ID (0x1f) silently no-ops this
+  // write — status 0x02 (ok), read-back even changes — while any other id
+  // (0x10 and 0x02 both tried) persists it and was physically confirmed at
+  // the button. Every other write in this file uses the shared default
+  // without issue, so this is the one exception.
+  assert.equal(RAZER_WRITE.buttonMapping.transactionId, RAZER_BUTTON_TRANSACTION_ID);
+  assert.notEqual(RAZER_BUTTON_TRANSACTION_ID, RAZER_TRANSACTION_ID);
+});
+
+test("a button-mapping read selects the control by index", () => {
+  const mouse4 = encodeRazerRequest(razerReadButtonMappingCommand("mouse4"));
+  const mouse5 = encodeRazerRequest(razerReadButtonMappingCommand("mouse5"));
+
+  assert.deepEqual([...mouse4.slice(8, 11)], [0x01, 0x04, 0x00]);
+  assert.deepEqual([...mouse5.slice(8, 11)], [0x01, 0x05, 0x00]);
+});
+
+test("Left Click is fixed on the Standard layer, matching Synapse's own restriction", () => {
+  assert.throws(() => razerSetButtonMappingCommand("leftClick", "Right Click"), RazerProtocolError);
+  assert.throws(() => razerSetButtonMappingCommand("leftClick", "Disabled"), RazerProtocolError);
+  assert.doesNotThrow(() => razerSetButtonMappingCommand("leftClick", "Left Click"));
+  // No such restriction on the other three — each can take any mapping,
+  // including disabling itself.
+  assert.doesNotThrow(() => razerSetButtonMappingCommand("rightClick", "Disabled"));
+  assert.doesNotThrow(() => razerSetButtonMappingCommand("mouse4", "Left Click"));
+});
+
+test("button-mapping writes round-trip through the decoder", () => {
+  for (const [control, mapping] of [
+    ["leftClick", "Left Click"],
+    ["rightClick", "Right Click"],
+    ["mouse4", "Mouse Button 4"],
+    ["mouse4", "Right Click"],
+    ["mouse4", "Left Click"],
+    ["mouse5", "Disabled"],
+  ] as const) {
+    const request = encodeRazerRequest(razerSetButtonMappingCommand(control, mapping));
+    assert.equal(razerDecodeButtonMapping(request.slice(8)), mapping);
+  }
+});
+
+/*
+ * Toggle-control fixtures (Scroll Up, Scroll Down, the bottom sensitivity
+ * button) are Viper V3 Pro captures logged in BUTTONS-RUNBOOK.md, same
+ * conventions as the button-mapping fixtures above. Scroll Click is
+ * deliberately not covered here yet — see the comment on RazerToggleControl.
+ */
+test("toggle control decodes its own default action", () => {
+  const scrollUp = decodeRazerResponse(
+    reply("02 1f 00 00 00 0a 02 8c 01 09 00 01 01 09 00 00 00 00"),
+    RAZER_READ.buttonMapping,
+  );
+  const scrollDown = decodeRazerResponse(
+    reply("02 1f 00 00 00 0a 02 8c 01 0a 00 01 01 0a 00 00 00 00"),
+    RAZER_READ.buttonMapping,
+  );
+  const sensitivityButton = decodeRazerResponse(
+    reply("02 1f 00 00 00 0a 02 8c 01 60 00 06 01 06 00 00 00 00"),
+    RAZER_READ.buttonMapping,
+  );
+
+  assert.equal(razerDecodeToggleControl("scrollUp", scrollUp), "Scroll Up");
+  assert.equal(razerDecodeToggleControl("scrollDown", scrollDown), "Scroll Down");
+  // The bottom button's default is actionType 0x06 — not the plain-button
+  // shape the other three use — captured verbatim rather than decoded from a
+  // shared formula, per the comment on RAZER_TOGGLE_CONTROL_INFO.
+  assert.equal(razerDecodeToggleControl("sensitivityButton", sensitivityButton), "Cycle Up Sensitivity Stages");
+});
+
+test("toggle control decodes Disabled", () => {
+  for (const [control, index] of [["scrollUp", "09"], ["scrollDown", "0a"], ["sensitivityButton", "60"]] as const) {
+    const args = decodeRazerResponse(
+      reply(`02 1f 00 00 00 0a 02 8c 01 ${index} 00 00 00 00 00 00 00 00`),
+      RAZER_READ.buttonMapping,
+    );
+    assert.equal(razerDecodeToggleControl(control, args), "Disabled");
+  }
+});
+
+test("an unrecognised toggle-control encoding decodes to null, not a guess", () => {
+  // Type 0x02 has never been captured for any control in this file.
+  const args = decodeRazerResponse(
+    reply("02 1f 00 00 00 0a 02 8c 01 09 00 02 01 09 00 00 00 00"),
+    RAZER_READ.buttonMapping,
+  );
+
+  assert.equal(razerDecodeToggleControl("scrollUp", args), null);
+});
+
+test("a toggle control does not decode another control's default as its own", () => {
+  // Scroll Down's own default (type=1, len=1, value=0x0a) is structurally
+  // identical to a plain-button record — decoding it as Scroll Up must not
+  // succeed just because the shape matches; the value has to match too.
+  const scrollDownDefault = decodeRazerResponse(
+    reply("02 1f 00 00 00 0a 02 8c 01 0a 00 01 01 0a 00 00 00 00"),
+    RAZER_READ.buttonMapping,
+  );
+
+  assert.equal(razerDecodeToggleControl("scrollUp", scrollDownDefault), null);
+});
+
+test("a toggle-control write matches the packet physically confirmed with it", () => {
+  // Scroll Up: transcribed from writeAndVerify() output restoring it to its
+  // own default — before (disabled) -> after (default) was a real, clean
+  // transition driven by this exact write, and scrolling up physically
+  // worked afterward. See BUTTONS-RUNBOOK.md.
+  const scrollUp = encodeRazerRequest(razerSetToggleControlCommand("scrollUp", "Scroll Up"), RAZER_BUTTON_TRANSACTION_ID);
+  assert.deepEqual([...scrollUp.slice(8, 18)], [0x01, 0x09, 0x00, 0x01, 0x01, 0x09, 0x00, 0x00, 0x00, 0x00]);
+  assert.equal(scrollUp[88], razerChecksum(scrollUp));
+
+  // Sensitivity button: both directions of its disable/restore cycle were
+  // clean transitions driven by this driver's own write and both physically
+  // confirmed — the most completely verified of the three.
+  const disable = encodeRazerRequest(razerSetToggleControlCommand("sensitivityButton", "Disabled"), RAZER_BUTTON_TRANSACTION_ID);
+  assert.deepEqual([...disable.slice(8, 18)], [0x01, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+  const restore = encodeRazerRequest(razerSetToggleControlCommand("sensitivityButton", "Cycle Up Sensitivity Stages"), RAZER_BUTTON_TRANSACTION_ID);
+  assert.deepEqual([...restore.slice(8, 18)], [0x01, 0x60, 0x00, 0x06, 0x01, 0x06, 0x00, 0x00, 0x00, 0x00]);
+});
+
+test("a toggle-control read selects the control by index", () => {
+  const scrollUp = encodeRazerRequest(razerReadToggleControlCommand("scrollUp"));
+  const scrollDown = encodeRazerRequest(razerReadToggleControlCommand("scrollDown"));
+  const sensitivityButton = encodeRazerRequest(razerReadToggleControlCommand("sensitivityButton"));
+
+  assert.deepEqual([...scrollUp.slice(8, 11)], [0x01, 0x09, 0x00]);
+  assert.deepEqual([...scrollDown.slice(8, 11)], [0x01, 0x0a, 0x00]);
+  assert.deepEqual([...sensitivityButton.slice(8, 11)], [0x01, 0x60, 0x00]);
+});
+
+test("an invalid label for a toggle control throws instead of sending garbage", () => {
+  assert.throws(() => razerSetToggleControlCommand("scrollUp", "Right Click"), RazerProtocolError);
+  assert.throws(() => razerSetToggleControlCommand("scrollUp", "Scroll Down"), RazerProtocolError);
+  assert.doesNotThrow(() => razerSetToggleControlCommand("scrollUp", "Scroll Up"));
+  assert.doesNotThrow(() => razerSetToggleControlCommand("scrollUp", "Disabled"));
+});
+
+test("toggle-control writes round-trip through the decoder", () => {
+  for (const control of RAZER_TOGGLE_CONTROLS) {
+    const info = RAZER_TOGGLE_CONTROL_INFO[control];
+    for (const label of [info.enabledLabel, "Disabled"]) {
+      const request = encodeRazerRequest(razerSetToggleControlCommand(control, label));
+      assert.equal(razerDecodeToggleControl(control, request.slice(8)), label);
+    }
+  }
+});
+
+test("button controls and toggle controls share no control names or option labels", () => {
+  // The two families write into the same status dict, keyed by control name
+  // (see hid.ts's readButtonMappings) — a shared key would let one family's
+  // renderer read the other's state. A shared option label ("Disabled"
+  // aside, which means the same thing everywhere) would risk the same
+  // confusion one level up, in the rendered <option> lists.
+  const buttonNames: readonly string[] = RAZER_BUTTON_CONTROLS;
+  const toggleNames: readonly string[] = RAZER_TOGGLE_CONTROLS;
+  assert.equal(buttonNames.some((name) => toggleNames.includes(name)), false);
+
+  const buttonOnlyMappings = RAZER_BUTTON_MAPPINGS.filter((mapping) => mapping !== "Disabled");
+  const toggleEnabledLabels = RAZER_TOGGLE_CONTROLS.map((control) => RAZER_TOGGLE_CONTROL_INFO[control].enabledLabel);
+  assert.equal(buttonOnlyMappings.some((mapping) => toggleEnabledLabels.includes(mapping)), false);
+});
+
+test("standard-matrix effects match openrazer's razer_chroma_standard_matrix_effect_* payloads", () => {
+  // No capture of this family exists yet, so these pin the reference
+  // (razerchromacommon.c). The declared size is each effect's own rather than
+  // its argument count: breathing declares eight bytes whatever it carries.
+  const cases: Array<{
+    effect: RazerStandardEffect;
+    options?: Parameters<typeof razerSetStandardEffectCommand>[1];
+    dataSize: number;
+    args: number[];
+  }> = [
+    { effect: "off", dataSize: 0x01, args: [0x00] },
+    { effect: "spectrum", dataSize: 0x01, args: [0x04] },
+    { effect: "wave", dataSize: 0x02, args: [0x01, 0x01] },
+    { effect: "static", options: { color: "#ff8000" }, dataSize: 0x04, args: [0x06, 0xff, 0x80, 0x00] },
+    { effect: "reactive", options: { color: "#00ff00", speed: 3 }, dataSize: 0x05, args: [0x02, 0x03, 0x00, 0xff, 0x00] },
+    { effect: "breathing-random", dataSize: 0x08, args: [0x03, 0x03] },
+    { effect: "breathing-single", options: { color: "#0000ff" }, dataSize: 0x08, args: [0x03, 0x01, 0x00, 0x00, 0xff] },
+    {
+      effect: "breathing-dual",
+      options: { color: "#ff0000", color2: "#00ff00" },
+      dataSize: 0x08,
+      args: [0x03, 0x02, 0xff, 0x00, 0x00, 0x00, 0xff, 0x00],
+    },
+  ];
+  for (const { effect, options, dataSize, args } of cases) {
+    const command = razerSetStandardEffectCommand(effect, options);
+    assert.deepEqual([command.commandClass, command.commandId, command.dataSize], [0x03, 0x0a, dataSize], effect);
+    assert.deepEqual(command.args, args, effect);
+  }
+});
+
+test("extended-matrix effects address the led they are given, defaulting to the logo", () => {
+  // No capture of the Basilisk V3 exists yet, so these pin openrazer's
+  // razer_chroma_extended_matrix_effect_* payloads on the leds its driver
+  // uses for that model: ZERO_LED, SCROLL_WHEEL_LED and LOGO_LED.
+  const logo = razerSetExtendedEffectCommand("static", { color: "#ff8000" });
+  assert.deepEqual(logo.args, [0x01, 0x04, 0x01, 0x00, 0x00, 0x01, 0xff, 0x80, 0x00]);
+  const all = razerSetExtendedEffectCommand("spectrum", { led: RAZER_LED.all });
+  assert.deepEqual([all.commandClass, all.commandId, all.dataSize], [0x0f, 0x02, 0x06]);
+  assert.deepEqual(all.args, [0x01, 0x00, 0x03, 0x00, 0x00, 0x00]);
+  // Wave: effect 0x04, direction, openrazer's fixed 0x28 speed, declared size 6.
+  const wave = razerSetExtendedEffectCommand("wave", { led: RAZER_LED.scrollWheel });
+  assert.equal(wave.dataSize, 0x06);
+  assert.deepEqual(wave.args, [0x01, 0x01, 0x04, 0x01, 0x28, 0x00]);
+  assert.deepEqual(razerSetExtendedEffectCommand("off", { led: RAZER_LED.logo }).args, [0x01, 0x04, 0x00, 0x00, 0x00, 0x00]);
+});
+
+test("extended-matrix brightness addresses one led through the storage byte", () => {
+  const read = razerReadExtendedBrightnessCommand(RAZER_LED.scrollWheel);
+  assert.deepEqual([read.commandClass, read.commandId, read.dataSize, read.args], [0x0f, 0x84, 0x03, [0x01, 0x01]]);
+  const write = razerSetExtendedBrightnessCommand(RAZER_LED.all, 50);
+  assert.deepEqual([write.commandClass, write.commandId, write.dataSize, write.args], [0x0f, 0x04, 0x03, [0x01, 0x00, 0x80]]);
+  assert.equal(decodeBacklightBrightness(Uint8Array.of(0x01, 0x00, 0x80)), 50);
+  assert.throws(() => razerSetExtendedBrightnessCommand(RAZER_LED.all, 101), RazerProtocolError);
+});
+
+test("a standard-matrix effect refuses to guess a missing colour or speed", () => {
+  assert.throws(() => razerSetStandardEffectCommand("static"), RazerProtocolError);
+  assert.throws(() => razerSetStandardEffectCommand("reactive", { color: "#ffffff" }), RazerProtocolError);
+  assert.throws(() => razerSetStandardEffectCommand("breathing-dual", { color: "#ffffff" }), RazerProtocolError);
+});
+
+test("backlight brightness addresses the backlight led through the storage byte", () => {
+  assert.deepEqual(RAZER_BACKLIGHT_BRIGHTNESS_READ.args, [0x01, 0x05]);
+  const write = razerSetBacklightBrightnessCommand(50);
+  assert.equal(write.commandId, RAZER_BACKLIGHT_BRIGHTNESS_READ.commandId & 0x7f);
+  assert.deepEqual(write.args, [0x01, 0x05, 0x80]);
+  assert.equal(decodeBacklightBrightness(Uint8Array.of(0x01, 0x05, 0xff)), 100);
+  assert.throws(() => razerSetBacklightBrightnessCommand(101), RazerProtocolError);
+});
+
+test("every whole brightness percentage survives the 0-255 round trip", () => {
+  // setLighting confirms brightness by reading it back, so a percentage that
+  // rounded differently on the way back would be reported as refused.
+  for (let percent = 0; percent <= 100; percent += 1) {
+    const level = razerSetBacklightBrightnessCommand(percent).args?.[2] ?? -1;
+    assert.equal(decodeBacklightBrightness(Uint8Array.of(0x01, 0x05, level)), percent);
+  }
 });

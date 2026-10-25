@@ -39,28 +39,69 @@ checklist.
 
 | Brand | Import |
 | --- | --- |
+| AJAZZ | `@openmouse/protocol/ajazz` |
 | ATK | `@openmouse/protocol/atk` |
+| Corsair | `@openmouse/protocol/corsair` |
+| Dareu | `@openmouse/protocol/dareu` |
+| Delux M800 Mini / M600 Pro | `@openmouse/protocol/delux` |
 | Endgame Gear OP1/XM2 8K | `@openmouse/protocol/endgame-gear-op1` |
+| Endgame Gear XM1r/OP1/OP1 RGB | `@openmouse/protocol/endgame-gear-ot` |
 | Endgame Gear wireless | `@openmouse/protocol/endgame-gear-we` |
+| Fantech | `@openmouse/protocol/fantech` |
 | Finalmouse | `@openmouse/protocol/finalmouse` |
+| G-Wolves | `@openmouse/protocol/gwolves` |
+| GearHub (AJAZZ / Attack Shark / Lingbao) | `@openmouse/protocol/gearhub` |
+| Glorious | `@openmouse/protocol/glorious` |
+| Glorious classic (Model O/D/I) | `@openmouse/protocol/glorious-classic` |
+| Glorious core2 (O2/D2 Pro 4K/8K) | `@openmouse/protocol/glorious-core2` |
+| HyperX | `@openmouse/protocol/hyperx` |
+| Incott | `@openmouse/protocol/incott` |
+| K-snake | `@openmouse/protocol/ksnake` |
 | Keychron | `@openmouse/protocol/keychron` |
-| Lamzu | `@openmouse/protocol/lamzu` |
+| Lamzu / CRDRAKO / Attack Shark / LunaFury | `@openmouse/protocol/lamzu` |
 | Logitech | `@openmouse/protocol/logitech` |
+| MCHOSE | `@openmouse/protocol/mchose` |
+| Microsoft | `@openmouse/protocol/microsoft` |
+| Motospeed | `@openmouse/protocol/motospeed` |
 | moddoMOUSE | `@openmouse/protocol/moddo` |
 | Ninjutso | `@openmouse/protocol/ninjutso` |
 | Orbital | `@openmouse/protocol/orbital` |
-| Pulsar | `@openmouse/protocol/pulsar` |
+| RAWM | `@openmouse/protocol/rawm` |
+| Pulsar / GravaStar | `@openmouse/protocol/pulsar` |
 | Razer legacy/current | `@openmouse/protocol/razer` |
+| Rapoo VT9 Pro | `@openmouse/protocol/rapoo` |
 | Razer V4 | `@openmouse/protocol/razer-v4` |
+| Ryunix | `@openmouse/protocol/ryunix` |
+| SteelSeries Rival 3 (Gen 1) | `@openmouse/protocol/steelseries` |
 | Teevolution | `@openmouse/protocol/teevolution` |
 | VGN | `@openmouse/protocol/vgn` |
+| WALLHACK | `@openmouse/protocol/wallhack` |
 | WLMouse | `@openmouse/protocol/wlmouse` |
+| Wooting | `@openmouse/protocol/wooting` |
+| Zaunkoenig | `@openmouse/protocol/zaunkoenig` |
 
 An exported protocol means OpenMouse implements that wire format. It does not
 claim every mouse from that brand works. When a catalog provides a `verified`
 field, use it to distinguish hardware-tested support from USB recognition.
 
+LunaFury uses the shared Lamzu/CompX driver at `@openmouse/protocol/lamzu`.
+LUNA33 firmware `0.0.26.0` has owner-confirmed cable/8K coverage; TYPE33 and
+bottom-button behavior are not hardware-verified. See the
+[support and testing notes](docs/lunafury-testing.md) for the verified scope.
+
 The Ninjutso catalog and packet layouts are derived from the JavaScript shipped
 by the official NinjaForce WebHID panel. They have automated transport and
 codec coverage, but are not marked as hardware-verified until tested on the
 corresponding Sora V2/V3 and TEN-family devices.
+
+AJAZZ AJ179 PRO is supported by the GearHub driver, identified by device id
+1851 rather than its shared receiver PID. USB, 2.4 GHz and Bluetooth settings
+have been exercised on hardware. See [docs/ajazz-aj179-pro.md](docs/ajazz-aj179-pro.md)
+for transport framing, verified writes and remaining limitations. This does
+not claim support for other AJAZZ models or measured high-rate Bluetooth input.
+
+The SteelSeries Rival 3 Gen 1 codec and driver are derived from the public
+rivalcfg project, corroborated against libratbag and OpenRGB. The device is
+write-only — only the firmware version can be read back — and no entry is
+marked hardware-verified yet. See
+[docs/steelseries-testing.md](docs/steelseries-testing.md).

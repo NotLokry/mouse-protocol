@@ -34,6 +34,18 @@ export const RAZER_TRANSACTION_ID_1F = 0x1f;
  */
 export const RAZER_TRANSACTION_ID = RAZER_TRANSACTION_ID_1F;
 
+/**
+ * The button-mapping write (class `0x02`) is the one command on this mouse
+ * that rejects `RAZER_TRANSACTION_ID` silently: status `0x02` (ok), the
+ * read-back even changes, but the physical button keeps its old function.
+ * Confirmed on hardware by writing a plain mouse-button action, pressing the
+ * button, and finding it unchanged with `0x1f` and correct with any other id
+ * (`0x02` and `0x10` both round-tripped and worked physically). Every other
+ * write on this mouse uses `0x1f` without issue, so this is specific to class
+ * `0x02` rather than a general transport quirk.
+ */
+export const RAZER_BUTTON_TRANSACTION_ID = 0x10;
+
 const ARGS_OFFSET = 8;
 const CHECKSUM_INDEX = 88;
 const CHECKSUM_FIRST = 2;
@@ -55,6 +67,8 @@ export interface RazerCommand {
   commandId: number;
   dataSize: number;
   args?: readonly number[];
+  /** Overrides the per-product transaction id for this command alone. See `RAZER_BUTTON_TRANSACTION_ID`. */
+  transactionId?: number;
 }
 
 /**
@@ -66,8 +80,18 @@ export interface RazerCommand {
  */
 export const RAZER_STORAGE = 0x01;
 
-/** The underglow's led id in openrazer's extended-matrix family. */
-const RAZER_LED_LOGO = 0x04;
+/**
+ * Led ids in openrazer's extended-matrix family (`razercommon.h`). `all` is
+ * `ZERO_LED`: one write drives every zone the mouse has.
+ */
+export const RAZER_LED = {
+  all: 0x00,
+  scrollWheel: 0x01,
+  logo: 0x04,
+} as const;
+
+/** The underglow's led id on the single-zone Cobra and Viper Mini. */
+const RAZER_LED_LOGO = RAZER_LED.logo;
 
 /** Read-only commands confirmed against Viper V3 Pro firmware 1.12. */
 export const RAZER_READ = {
@@ -82,24 +106,61 @@ export const RAZER_READ = {
   pollingRate: { commandClass: 0x00, commandId: 0x85, dataSize: 0x01 },
   pollingRateExtended: { commandClass: 0x00, commandId: 0xc0, dataSize: 0x02, args: [0x00] },
   liftOff: { commandClass: 0x0b, commandId: 0x85, dataSize: 0x05 },
+  /**
+   * One control's button mapping. `args` is `[0x01, controlIndex, layer]`.
+   * `controlIndex` reliably selects the right control — confirmed by reading
+   * several controls back to back and always getting that control's own data.
+   * `layer` is not honored the same way: requesting Hypershift (`0x01`) for a
+   * control whose Standard mapping was just read back returned the Standard
+   * value again. Only Standard-layer reads are trusted.
+   */
+  buttonMapping: { commandClass: 0x02, commandId: 0x8c, dataSize: 0x0a },
 } as const satisfies Record<string, RazerCommand>;
 
 /**
  * Write commands confirmed against Viper V3 Pro firmware 1.12.
  *
  * Razer pairs each read with a write that clears the high bit of the command
- * id. Only commands verified on hardware belong here — in particular the DPI
- * stage table (`0x04`/`0x06`) is absent on purpose, because a wrong length
- * there is the one realistic way to corrupt stored settings.
+ * id. The DPI stage table write (`0x04`/`0x06`) mirrors the read's fixed
+ * 38-byte payload (`0x26`) byte for byte, exactly as OpenRazer's kernel
+ * driver sends it — a wrong length there is the one realistic way to corrupt
+ * stored settings, so the length is pinned to the read-back rather than
+ * computed from the stage count.
  */
 export const RAZER_WRITE = {
   dpi: { commandClass: 0x04, commandId: 0x05, dataSize: 0x07 },
+  dpiStages: { commandClass: 0x04, commandId: 0x06, dataSize: 0x26 },
   pollingRate: { commandClass: 0x00, commandId: 0x05, dataSize: 0x01 },
   pollingRateExtended: { commandClass: 0x00, commandId: 0x40, dataSize: 0x02 },
   liftOff: { commandClass: 0x0b, commandId: 0x05, dataSize: 0x0a },
   sensorSetting: { commandClass: 0x0b, commandId: 0x0b, dataSize: 0x04 },
   sleepTimeout: { commandClass: 0x07, commandId: 0x03, dataSize: 0x02 },
   lowPowerThreshold: { commandClass: 0x07, commandId: 0x01, dataSize: 0x02 },
+  /**
+   * Silently rejects `RAZER_TRANSACTION_ID` — see `RAZER_BUTTON_TRANSACTION_ID`.
+   * `razerSetButtonMappingCommand` and `razerSetToggleControlCommand` are the
+   * only places that should build this.
+   *
+   * **Stored in device memory, not volatile.** Confirmed on a Viper V3 Pro
+   * (`0x00c1`): Mouse Button 4 was disabled, the host application closed, the
+   * mouse powered off at its switch for 10 seconds and powered back on. The
+   * button was still dead on reconnect and the read reported Disabled, with
+   * Synapse never running. So a caller does not need to re-apply mappings
+   * after a power cycle, and a user's change survives independently of any
+   * host software.
+   *
+   * The leading argument byte is always `0x01` here. On this device `0x01` is
+   * also `RAZER_STORAGE`, the persistent store DPI writes through, which makes
+   * a storage selector the obvious reading — but that byte has never been
+   * varied on this command, so it is recorded as an unknown rather than
+   * assigned that meaning.
+   */
+  buttonMapping: {
+    commandClass: 0x02,
+    commandId: 0x0c,
+    dataSize: 0x0a,
+    transactionId: RAZER_BUTTON_TRANSACTION_ID,
+  },
 } as const satisfies Record<string, Omit<RazerCommand, "args">>;
 
 export function razerSetDpiCommand(x: number, y: number, storageByte: number = RAZER_STORAGE): RazerCommand {
@@ -117,6 +178,55 @@ export function razerSetDpiCommand(x: number, y: number, storageByte: number = R
  */
 export function razerReadDpiCommand(storageByte: number = RAZER_STORAGE): RazerCommand {
   return { ...RAZER_READ.dpi, args: [storageByte] };
+}
+
+/** The stored stage-table read, parameterized like `razerReadDpiCommand`. */
+export function razerReadDpiStagesCommand(storageByte: number = RAZER_STORAGE): RazerCommand {
+  return { ...RAZER_READ.dpiStages, args: [storageByte] };
+}
+
+/** The fixed number of stage slots a Razer stage table carries. */
+export const RAZER_MAX_DPI_STAGES = 5;
+
+/**
+ * Rewrites the whole stored DPI stage table (`0x04`/`0x06`), mirroring the
+ * matching read's fixed `0x26` payload: `[storage, active, count, stage
+ * records...]` where each record is `[index, xHi, xLo, yHi, yLo, 0, 0]`, with
+ * unused slots left zero and the count byte telling the firmware to ignore
+ * them. `active` is one-based, matching how the mouse numbers its stages in
+ * both the DPI-stages read and `razerSetDpiCommand`.
+ */
+export function razerSetDpiStagesCommand(
+  active: number,
+  stages: readonly RazerDpi[],
+  storageByte: number = RAZER_STORAGE,
+): RazerCommand {
+  if (stages.length < 1 || stages.length > RAZER_MAX_DPI_STAGES) {
+    throw new RazerProtocolError(`A Razer mouse holds between 1 and ${RAZER_MAX_DPI_STAGES} DPI stages.`);
+  }
+  if (!Number.isInteger(active) || active < 1 || active > stages.length) {
+    throw new RazerProtocolError(`Active DPI stage must be between 1 and ${stages.length}.`);
+  }
+  for (const stage of stages) {
+    for (const axis of [stage.x, stage.y]) {
+      if (!Number.isInteger(axis) || axis < 0 || axis > 0xffff) {
+        throw new RazerProtocolError("DPI stage values must be whole numbers between 0 and 65535.");
+      }
+    }
+  }
+  const args = new Array(RAZER_READ.dpiStages.dataSize).fill(0);
+  args[0] = storageByte;
+  args[1] = active;
+  args[2] = stages.length;
+  stages.forEach((stage, index) => {
+    const offset = STAGE_OFFSET + index * STAGE_LENGTH;
+    args[offset] = index;
+    args[offset + 1] = (stage.x >> 8) & 0xff;
+    args[offset + 2] = stage.x & 0xff;
+    args[offset + 3] = (stage.y >> 8) & 0xff;
+    args[offset + 4] = stage.y & 0xff;
+  });
+  return { ...RAZER_WRITE.dpiStages, args };
 }
 
 /** Seconds, big-endian, in the same encoding the matching read returns. */
@@ -154,6 +264,7 @@ export type RazerExtendedEffect =
   | "off"
   | "static"
   | "spectrum"
+  | "wave"
   | "reactive"
   | "breathing-random"
   | "breathing-single"
@@ -164,6 +275,7 @@ export const RAZER_EFFECT = {
   off: 0x00,
   static: 0x01,
   spectrum: 0x03,
+  wave: 0x04,
   reactive: 0x05,
   "breathing-random": 0x02,
   "breathing-single": 0x02,
@@ -183,14 +295,16 @@ export function parseRazerColor(hex: string): [number, number, number] {
 }
 
 /**
- * Extended effect command for the Viper Mini's extended-matrix family (`0x0f` /
- * `0x02`), matching openrazer's `razer_chroma_extended_matrix_effect_*`
- * functions, which this mouse dispatches through with `VARSTORE` and the logo
- * led. The mouse's one 1x1 matrix means a single underglow zone.
+ * Extended effect command for the extended-matrix family (`0x0f` / `0x02`),
+ * matching openrazer's `razer_chroma_extended_matrix_effect_*` functions,
+ * which it dispatches through with `VARSTORE` and a led id. Single-zone mice
+ * (Viper Mini, Cobra) take the default logo led; multi-zone ones (Basilisk V3)
+ * name the zone through `options.led`.
  *
- * All effects share the `[VARSTORE, logo, effect]` header. Breathing variants
- * differ only in the colour count byte and payload length, and reactive adds a
- * speed level between the header and its single colour.
+ * All effects share the `[VARSTORE, led, effect]` header. Breathing variants
+ * differ only in the colour count byte and payload length, reactive adds a
+ * speed level between the header and its single colour, and wave carries a
+ * direction and openrazer's fixed speed byte.
  */
 export function razerSetExtendedEffectCommand(
   effect: RazerExtendedEffect,
@@ -198,14 +312,20 @@ export function razerSetExtendedEffectCommand(
     color?: string;
     color2?: string;
     speed?: RazerReactiveSpeed;
+    led?: number;
   } = {},
 ): RazerCommand {
-  const args: number[] = [RAZER_STORAGE, RAZER_LED_LOGO, RAZER_EFFECT[effect]];
+  const args: number[] = [RAZER_STORAGE, options.led ?? RAZER_LED_LOGO, RAZER_EFFECT[effect]];
   switch (effect) {
     case "off":
     case "spectrum":
     case "breathing-random":
       args.push(0x00, 0x00, 0x00);
+      break;
+    case "wave":
+      // openrazer: arguments[3] = direction, [4] = 0x28 "speed, lower is
+      // faster", declared size 6.
+      args.push(WAVE_DIRECTION, WAVE_SPEED, 0x00);
       break;
     case "static":
       if (!options.color) throw new RazerProtocolError(`${effect} needs a colour.`);
@@ -230,6 +350,182 @@ export function razerSetExtendedEffectCommand(
     commandId: 0x02,
     dataSize: args.length,
     args,
+  };
+}
+
+/**
+ * The older Chroma lighting family (class `0x03`), from openrazer's
+ * `razer_chroma_standard_*` functions, which it sends to the Diamondback
+ * Chroma on transaction id `0xff`. Not yet confirmed on hardware by this
+ * project.
+ *
+ * The effect write names no led and carries no storage byte: one effect
+ * drives every LED on the mouse. Only the brightness pair addresses a led, the
+ * backlight, through the storage byte.
+ */
+export type RazerStandardEffect = RazerExtendedEffect | "wave";
+
+/** Effect ids from openrazer's `MATRIX_EFFECT_*` (razercommon.h). */
+export const RAZER_STANDARD_EFFECT = {
+  off: 0x00,
+  wave: 0x01,
+  reactive: 0x02,
+  breathing: 0x03,
+  spectrum: 0x04,
+  static: 0x06,
+} as const;
+
+/** Breathing's first argument: how many colours follow, or random. */
+const BREATHING_SINGLE = 0x01;
+const BREATHING_DUAL = 0x02;
+const BREATHING_RANDOM = 0x03;
+
+// ponytail: one fixed wave direction (openrazer takes 1 or 2); add a direction
+// option when the lighting card grows a control for it.
+const WAVE_DIRECTION = 0x01;
+/** The extended wave's speed byte; openrazer always sends this value. */
+const WAVE_SPEED = 0x28;
+
+/** The backlight's led id in openrazer's standard family (`BACKLIGHT_LED`). */
+const RAZER_LED_BACKLIGHT = 0x05;
+
+/** Brightness travels on a 0-255 scale; the panel works in whole percent. */
+const BRIGHTNESS_SCALE = 255;
+
+/**
+ * Effect write (`0x03`/`0x0a`) matching openrazer's
+ * `razer_chroma_standard_matrix_effect_*` byte for byte, declared data sizes
+ * included: the effect id, then that effect's own fields. Breathing always
+ * declares eight bytes, whatever its colour count, and reactive puts its speed
+ * before the colour.
+ */
+export function razerSetStandardEffectCommand(
+  effect: RazerStandardEffect,
+  options: {
+    color?: string;
+    color2?: string;
+    speed?: RazerReactiveSpeed;
+  } = {},
+): RazerCommand {
+  const command = (dataSize: number, args: number[]): RazerCommand => ({
+    commandClass: 0x03,
+    commandId: 0x0a,
+    dataSize,
+    args,
+  });
+  const color = (value: string | undefined, message: string) => {
+    if (!value) throw new RazerProtocolError(message);
+    return parseRazerColor(value);
+  };
+  switch (effect) {
+    case "off":
+      return command(0x01, [RAZER_STANDARD_EFFECT.off]);
+    case "spectrum":
+      return command(0x01, [RAZER_STANDARD_EFFECT.spectrum]);
+    case "wave":
+      return command(0x02, [RAZER_STANDARD_EFFECT.wave, WAVE_DIRECTION]);
+    case "static":
+      return command(0x04, [RAZER_STANDARD_EFFECT.static, ...color(options.color, "static needs a colour.")]);
+    case "reactive":
+      if (!options.speed) throw new RazerProtocolError("Reactive needs a speed.");
+      return command(0x05, [
+        RAZER_STANDARD_EFFECT.reactive,
+        RAZER_EFFECT_SPEED[options.speed],
+        ...color(options.color, "reactive needs a colour."),
+      ]);
+    case "breathing-random":
+      return command(0x08, [RAZER_STANDARD_EFFECT.breathing, BREATHING_RANDOM]);
+    case "breathing-single":
+      return command(0x08, [
+        RAZER_STANDARD_EFFECT.breathing,
+        BREATHING_SINGLE,
+        ...color(options.color, "Breathing single needs a colour."),
+      ]);
+    case "breathing-dual":
+      return command(0x08, [
+        RAZER_STANDARD_EFFECT.breathing,
+        BREATHING_DUAL,
+        ...color(options.color, "Breathing dual needs two colours."),
+        ...color(options.color2, "Breathing dual needs two colours."),
+      ]);
+  }
+}
+
+/** Activate the volatile frame after writing single-row RGB cells. */
+export function razerSetStandardCustomEffectCommand(): RazerCommand {
+  // OpenRazer's standard custom effect selects the volatile frame (NOSTORE).
+  return { commandClass: 0x03, commandId: 0x0a, dataSize: 0x02, args: [0x05, 0x00] };
+}
+
+/**
+ * Diamondback Chroma / Mamba TE single-row frame (`0x03`/`0x0c`), matching
+ * OpenRazer's razer_chroma_misc_one_row_set_custom_frame. Columns are inclusive
+ * and zero-based. Keep the fixed 0x32 data size; at most 16 RGB cells fit.
+ * A partial frame leaves the other cells in the device's frame buffer alone.
+ */
+export function razerSetOneRowCustomFrameCommand(startColumn: number, colors: readonly string[]): RazerCommand {
+  if (!Number.isInteger(startColumn) || startColumn < 0 || startColumn > 255) {
+    throw new RazerProtocolError("The start column must be a whole byte from 0 to 255.");
+  }
+  if (colors.length < 1 || colors.length > 16 || startColumn + colors.length - 1 > 255) {
+    throw new RazerProtocolError("A single-row frame needs 1 to 16 colours within columns 0 to 255.");
+  }
+  return {
+    commandClass: 0x03,
+    commandId: 0x0c,
+    dataSize: 0x32,
+    args: [startColumn, startColumn + colors.length - 1, ...colors.flatMap((color) => parseRazerColor(color))],
+  };
+}
+
+/** Backlight brightness read (`0x03`/`0x83`); the level answers in the third byte. */
+export const RAZER_BACKLIGHT_BRIGHTNESS_READ: RazerCommand = {
+  commandClass: 0x03,
+  commandId: 0x83,
+  dataSize: 0x03,
+  args: [RAZER_STORAGE, RAZER_LED_BACKLIGHT],
+};
+
+/** Backlight brightness write (`0x03`/`0x03`), in the same layout the read answers. */
+export function razerSetBacklightBrightnessCommand(percent: number): RazerCommand {
+  if (!Number.isInteger(percent) || percent < 0 || percent > 100) {
+    throw new RazerProtocolError("Brightness must be a whole percentage from 0 to 100.");
+  }
+  return {
+    commandClass: 0x03,
+    commandId: 0x03,
+    dataSize: 0x03,
+    args: [RAZER_STORAGE, RAZER_LED_BACKLIGHT, Math.round((percent * BRIGHTNESS_SCALE) / 100)],
+  };
+}
+
+/**
+ * Whole percent; every whole percent survives the 0-255 round trip unchanged.
+ * Both brightness families answer the level in the third byte.
+ */
+export function decodeBacklightBrightness(args: Uint8Array): number {
+  return Math.round((args[2] * 100) / BRIGHTNESS_SCALE);
+}
+
+/**
+ * Extended-matrix brightness read (`0x0f`/`0x84`) for one led, from openrazer's
+ * `razer_chroma_extended_matrix_get_brightness`; the level answers in the
+ * third byte like the backlight pair above.
+ */
+export function razerReadExtendedBrightnessCommand(led: number): RazerCommand {
+  return { commandClass: 0x0f, commandId: 0x84, dataSize: 0x03, args: [RAZER_STORAGE, led] };
+}
+
+/** Extended-matrix brightness write (`0x0f`/`0x04`), same layout as the read. */
+export function razerSetExtendedBrightnessCommand(led: number, percent: number): RazerCommand {
+  if (!Number.isInteger(percent) || percent < 0 || percent > 100) {
+    throw new RazerProtocolError("Brightness must be a whole percentage from 0 to 100.");
+  }
+  return {
+    commandClass: 0x0f,
+    commandId: 0x04,
+    dataSize: 0x03,
+    args: [RAZER_STORAGE, led, Math.round((percent * BRIGHTNESS_SCALE) / 100)],
   };
 }
 
@@ -494,6 +790,36 @@ export function razerEnableAsymmetricLiftOffCommand(): RazerCommand {
 }
 
 /**
+ * Canonical asymmetric lift-off unlock: the same sensor-setting write as
+ * `razerEnableAsymmetricLiftOffCommand` with value `0x00`. The 1.14 sweep found
+ * both values arm the pair write, but only the `0x01` form is verified on
+ * 1.12, so this is the driver's fallback arm, never the shipped form.
+ */
+export function razerEnableAsymmetricLiftOffCanonicalCommand(): RazerCommand {
+  return {
+    ...RAZER_WRITE.sensorSetting,
+    args: [0x00, RAZER_SENSOR_SELECTOR, RAZER_SENSOR_SETTING.asymmetric, 0x00],
+  };
+}
+
+/**
+ * Calibration-mode-on step, `0x0b`/`0x03` `00 04 01`. Not required on the
+ * swept firmware 1.14 units, where the unlock alone arms the pair write, so it
+ * is sent only as the last-resort arm in `setLiftOff` for a unit that refuses
+ * both unlock values. Carries the same sensor selector as the settings writes;
+ * the layout is read off the experiment notes rather than verified on
+ * hardware, which is why it comes last.
+ */
+export function razerEnableSensorCalibrationCommand(): RazerCommand {
+  return {
+    commandClass: 0x0b,
+    commandId: 0x03,
+    dataSize: 0x03,
+    args: [0x00, RAZER_SENSOR_SELECTOR, 0x01],
+  };
+}
+
+/**
  * Lift-off write, transcribed from the vendor software's own packet rather than
  * inferred: `dataSize 0x0a`, then `00 04` before the pair. It does NOT mirror
  * the read's layout, which is what three earlier guesses assumed — each was
@@ -542,3 +868,189 @@ export function decodeExtendedPollingRate(args: Uint8Array): number {
   return Math.round(8000 / args[1]);
 }
 
+
+/**
+ * The four controls the button-mapping write has been confirmed against, on
+ * the Viper V3 Pro's Standard layer. Left Click and Right Click use standard
+ * USB HID button numbering (1, 2), confirmed physically rather than assumed —
+ * writing Mouse Button 4's slot with each index and pressing it produced a
+ * real left-click and right-click. Mouse Button 4/5 matched their Synapse
+ * names directly. Cross-assignable among each other, plus Disabled.
+ *
+ * Scroll Up, Scroll Down and the bottom sensitivity button ship too, but as a
+ * separate, narrower kind of control — see `RazerToggleControl`. Scroll Click
+ * and Hypershift remain unshipped: Scroll Click's index is known but this
+ * driver's own write to it has only been physically checked against the wrong
+ * action, and Hypershift's read does not honour a requested layer at all.
+ */
+export type RazerButtonControl = "leftClick" | "rightClick" | "mouse4" | "mouse5";
+
+export const RAZER_BUTTON_CONTROLS: readonly RazerButtonControl[] = ["leftClick", "rightClick", "mouse4", "mouse5"];
+
+const RAZER_BUTTON_CONTROL_INDEX: Record<RazerButtonControl, number> = {
+  leftClick: 0x01,
+  rightClick: 0x02,
+  mouse4: 0x04,
+  mouse5: 0x05,
+};
+
+/** Every mapping the panel can offer: each control's own action, plus Disabled. */
+export const RAZER_BUTTON_MAPPINGS = ["Left Click", "Right Click", "Mouse Button 4", "Mouse Button 5", "Disabled"] as const;
+export type RazerButtonMapping = (typeof RAZER_BUTTON_MAPPINGS)[number];
+
+// Each control's own label doubles as the mapping that plays its native
+// action, so the type carries that: "leftClick"'s label is also a valid
+// RazerButtonMapping, not just display text.
+export const RAZER_BUTTON_CONTROL_LABEL: Record<RazerButtonControl, RazerButtonMapping> = {
+  leftClick: "Left Click",
+  rightClick: "Right Click",
+  mouse4: "Mouse Button 4",
+  mouse5: "Mouse Button 5",
+};
+
+const RAZER_MAPPING_CONTROL: Partial<Record<RazerButtonMapping, RazerButtonControl>> = Object.fromEntries(
+  RAZER_BUTTON_CONTROLS.map((control) => [RAZER_BUTTON_CONTROL_LABEL[control], control]),
+);
+
+/**
+ * Encodes a mapping into the write's trailing `[type, len, value]`.
+ * `type=0x01, len=0x01, value=<control index>` makes the target control
+ * perform *that* index's action — confirmed cross-control on hardware, not
+ * just identity: Mouse Button 4 written with Right Click's index physically
+ * right-clicked. `type=0x00` is Disabled.
+ */
+function razerEncodeButtonMapping(mapping: RazerButtonMapping): readonly [number, number, number] {
+  if (mapping === "Disabled") return [0x00, 0x00, 0x00];
+  const control = RAZER_MAPPING_CONTROL[mapping];
+  if (!control) throw new RazerProtocolError(`"${mapping}" is not a button mapping this driver can send.`);
+  return [0x01, 0x01, RAZER_BUTTON_CONTROL_INDEX[control]];
+}
+
+/**
+ * Decodes a button-mapping reply back to a label. Returns null for an
+ * encoding this driver does not recognise — a keyboard shortcut, a control
+ * outside the four shipped here, or anything else unmapped — so a caller can
+ * preserve it rather than misrepresent it as one of the known five.
+ */
+export function razerDecodeButtonMapping(args: Uint8Array): RazerButtonMapping | null {
+  const type = args[3];
+  const value = args[5];
+  if (type === 0x00) return "Disabled";
+  if (type !== 0x01) return null;
+  const control = RAZER_BUTTON_CONTROLS.find((candidate) => RAZER_BUTTON_CONTROL_INDEX[candidate] === value);
+  return control ? RAZER_BUTTON_CONTROL_LABEL[control] : null;
+}
+
+/** Only the Standard layer is trusted for reads — see `RAZER_READ.buttonMapping`. */
+export function razerReadButtonMappingCommand(control: RazerButtonControl): RazerCommand {
+  return { ...RAZER_READ.buttonMapping, args: [0x01, RAZER_BUTTON_CONTROL_INDEX[control], 0x00] };
+}
+
+/**
+ * Left Click cannot be reassigned or disabled on the Standard layer — Synapse
+ * enforces the same restriction, presumably because it is the only reliable
+ * way to interact with Windows (and with Synapse itself) at all. Exported so
+ * the UI can disable the control outright instead of letting a user hit the
+ * error.
+ */
+export const RAZER_LOCKED_BUTTON_CONTROL: RazerButtonControl = "leftClick";
+
+export function razerSetButtonMappingCommand(control: RazerButtonControl, mapping: RazerButtonMapping): RazerCommand {
+  if (control === RAZER_LOCKED_BUTTON_CONTROL && mapping !== RAZER_BUTTON_CONTROL_LABEL[RAZER_LOCKED_BUTTON_CONTROL]) {
+    throw new RazerProtocolError(
+      `${RAZER_BUTTON_CONTROL_LABEL[RAZER_LOCKED_BUTTON_CONTROL]} is fixed on the Standard layer and cannot be reassigned or disabled.`,
+    );
+  }
+  const [type, len, value] = razerEncodeButtonMapping(mapping);
+  return {
+    ...RAZER_WRITE.buttonMapping,
+    args: [0x01, RAZER_BUTTON_CONTROL_INDEX[control], 0x00, type, len, value, 0x00, 0x00, 0x00, 0x00],
+  };
+}
+
+/**
+ * Scroll Up, Scroll Down and the bottom sensitivity button, each restricted
+ * to exactly two states: their own factory action, or Disabled. Unlike
+ * `RazerButtonControl`, these are not cross-assignable — assigning one of
+ * these an action from `RAZER_BUTTON_MAPPINGS`, or assigning a button one of
+ * these controls' actions, has never been attempted on hardware and is not
+ * exposed here. Deliberately a separate type from `RazerButtonControl` and
+ * kept out of `RAZER_BUTTON_MAPPINGS` for that reason, even though three of
+ * these four values would otherwise fit the same plain-action shape.
+ *
+ * Each control's enabled state is a fixed, opaque payload captured verbatim
+ * from the mouse rather than something constructed from a shared formula,
+ * because the bottom sensitivity button's default ("Cycle Up Sensitivity
+ * Stages") is not a plain-button action at all — `actionType=0x06`, a type
+ * this driver otherwise never decodes.
+ *
+ * Scroll Click (index `0x03`) is deliberately not included: its index is
+ * known and Synapse's own disable was physically confirmed, but the one
+ * physical test run against this driver's own write to that index checked
+ * the wrong result (scroll-down instead of the click), so it has not
+ * separately cleared this driver's own bar yet.
+ */
+export type RazerToggleControl = "scrollUp" | "scrollDown" | "sensitivityButton";
+
+export const RAZER_TOGGLE_CONTROLS: readonly RazerToggleControl[] = ["scrollUp", "scrollDown", "sensitivityButton"];
+
+export interface RazerToggleControlInfo {
+  index: number;
+  /** Display heading for the control itself, independent of its current state. */
+  label: string;
+  /** The label for this control's one non-Disabled state. */
+  enabledLabel: string;
+  /** `[actionType, actionLen, actionValue]` for the enabled state, captured verbatim from the mouse. */
+  enabledArgs: readonly [number, number, number];
+}
+
+export const RAZER_TOGGLE_CONTROL_INFO: Record<RazerToggleControl, RazerToggleControlInfo> = {
+  scrollUp: { index: 0x09, label: "Scroll Up", enabledLabel: "Scroll Up", enabledArgs: [0x01, 0x01, 0x09] },
+  scrollDown: { index: 0x0a, label: "Scroll Down", enabledLabel: "Scroll Down", enabledArgs: [0x01, 0x01, 0x0a] },
+  sensitivityButton: {
+    index: 0x60,
+    label: "Sensitivity Button",
+    enabledLabel: "Cycle Up Sensitivity Stages",
+    enabledArgs: [0x06, 0x01, 0x06],
+  },
+};
+
+/** Only the Standard layer is trusted for reads — see `RAZER_READ.buttonMapping`. */
+export function razerReadToggleControlCommand(control: RazerToggleControl): RazerCommand {
+  return { ...RAZER_READ.buttonMapping, args: [0x01, RAZER_TOGGLE_CONTROL_INFO[control].index, 0x00] };
+}
+
+/**
+ * Decodes a toggle control's reply to its own enabled label or "Disabled".
+ * Returns null for anything else — Hypershift data, a Synapse reassignment
+ * this driver has never captured, or noise — so a caller can preserve it
+ * rather than misrepresent it as one of the two known states.
+ */
+export function razerDecodeToggleControl(control: RazerToggleControl, args: Uint8Array): string | null {
+  const type = args[3];
+  const len = args[4];
+  const value = args[5];
+  if (type === 0x00 && len === 0x00 && value === 0x00) return "Disabled";
+  const info = RAZER_TOGGLE_CONTROL_INFO[control];
+  const [enabledType, enabledLen, enabledValue] = info.enabledArgs;
+  if (type === enabledType && len === enabledLen && value === enabledValue) return info.enabledLabel;
+  return null;
+}
+
+export function razerSetToggleControlCommand(control: RazerToggleControl, label: string): RazerCommand {
+  const info = RAZER_TOGGLE_CONTROL_INFO[control];
+  let type: number;
+  let len: number;
+  let value: number;
+  if (label === "Disabled") {
+    [type, len, value] = [0x00, 0x00, 0x00];
+  } else if (label === info.enabledLabel) {
+    [type, len, value] = info.enabledArgs;
+  } else {
+    throw new RazerProtocolError(`${info.label} only supports "${info.enabledLabel}" or "Disabled".`);
+  }
+  return {
+    ...RAZER_WRITE.buttonMapping,
+    args: [0x01, info.index, 0x00, type, len, value, 0x00, 0x00, 0x00, 0x00],
+  };
+}

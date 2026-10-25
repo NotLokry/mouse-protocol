@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { MouseLighting } from "../mouse-types.ts";
 
 // `hid.ts` schedules its inter-exchange delay through `window`, which node does
 // not provide. The global carries the same `setTimeout`.
@@ -32,6 +33,22 @@ interface FakeOptions {
   productId?: number;
   /** DPI pair the fake reports, defaulting to 1600 × 1600. */
   dpi?: [number, number];
+  /**
+   * The `0x04`/`0x86` DPI stage table the fake answers, when it answers one at
+   * all. `active` is 1-based, matching what the mouse reports. When omitted,
+   * the read is refused as unsupported, so the driver degrades to no stage
+   * editor. A `0x04`/`0x06` write updates the fake's stored table, which later
+   * reads report back.
+   */
+  dpiStages?: { values: number[]; active: number };
+  /**
+   * The `0x0b`/`0x0b` value that actually arms the pair write. Defaults to
+   * 0x01; a unit that refuses that form but accepts the canonical 0x00 models
+   * the reporter's hardware.
+   */
+  asymmetricArmValue?: number;
+  /** Require the `0x0b`/`0x03` calibration step before a pair write lands. */
+  calibOnRequired?: boolean;
 }
 
 function replyPacket(commandClass: number, commandId: number, dataSize: number, args: number[], status: number): Uint8Array {
@@ -46,6 +63,12 @@ function replyPacket(commandClass: number, commandId: number, dataSize: number, 
   return packet;
 }
 
+/** A sent/encoded packet's argument region, indexed from the first arg byte. */
+function sliceArgs(packet: Uint8Array, offset: number, length?: number): Uint8Array {
+  const start = 8 + offset;
+  return length === undefined ? packet.slice(start) : packet.slice(start, start + length);
+}
+
 /**
  * A mouse that answers only the lift-off commands, storing the pair the way the
  * real one does: the write carries `00 04` before the levels, and each level is
@@ -55,7 +78,12 @@ function fakeMouse(state: FakeLiftOff, options: FakeOptions = {}) {
   const sent: Uint8Array[] = [];
   let pending = new Uint8Array(RAZER_PACKET_LENGTH);
   let corruptRemaining = options.corruptSends ?? 0;
+  let calibratedOn = false;
   let dpi = options.dpi ?? [1600, 1600];
+  let pollingDivisor = 8;
+  let dpiStages = options.dpiStages
+    ? { active: options.dpiStages.active, values: [...options.dpiStages.values] }
+    : undefined;
   const device = {
     vendorId: 0x1532,
     productId: options.productId ?? 0x00c1,
@@ -80,19 +108,57 @@ function fakeMouse(state: FakeLiftOff, options: FakeOptions = {}) {
         pending = replyPacket(commandClass, commandId, data[5], [data[8], (dpi[0] >> 8) & 0xff, dpi[0] & 0xff, (dpi[1] >> 8) & 0xff, dpi[1] & 0xff, 0, 0], RAZER_STATUS.ok);
         return;
       }
+      // The stage table read, mirrored the way the real reply lays it out:
+      // active (1-based) at arg 1, count at arg 2, then seven-byte records
+      // (flags, X big-endian, Y big-endian, padding). Refused unless a table
+      // was supplied, exercising the degradation path for models that do not
+      // answer class `0x04`/`0x86`. The matching write (`0x04`/`0x06`) stores
+      // the table it carries — active at arg 1, count at arg 2, then the
+      // seven-byte records' X pair — so read-after-write confirmation works.
+      const stagesRead = commandClass === 0x04 && commandId === 0x86;
+      const stagesWrite = commandClass === 0x04 && commandId === 0x06;
+      if (stagesRead || stagesWrite) {
+        if (!dpiStages) {
+          pending = replyPacket(commandClass, commandId, data[5], [], RAZER_STATUS.unsupported);
+          return;
+        }
+        if (stagesWrite && !options.ignoreWrites) {
+          const count = data[10];
+          const values: number[] = [];
+          for (let index = 0; index < count; index += 1) {
+            values.push((data[12 + index * 7] << 8) | data[13 + index * 7]);
+          }
+          dpiStages = { active: data[9], values };
+        }
+        const args: number[] = [0x00, dpiStages.active, dpiStages.values.length];
+        for (const value of dpiStages.values) {
+          args.push(0x00, (value >> 8) & 0xff, value & 0xff, (value >> 8) & 0xff, value & 0xff, 0x00, 0x00);
+        }
+        pending = replyPacket(commandClass, commandId, 0x26, args, RAZER_STATUS.ok);
+        return;
+      }
+      const pollingWrite = commandClass === 0x00 && commandId === 0x40;
+      const pollingRead = commandClass === 0x00 && commandId === 0xc0;
+      if (pollingWrite) pollingDivisor = data[9];
+      if (pollingWrite || pollingRead) {
+        pending = replyPacket(commandClass, commandId, data[5], [data[8], pollingDivisor], RAZER_STATUS.ok);
+        return;
+      }
       // Matched on class as well as id: polling shares both ids on class 0x00,
       // so an id-only match would let a later test mutate the pair by accident.
       const liftOffWrite = commandClass === 0x0b && commandId === 0x05;
       const liftOffRead = commandClass === 0x0b && commandId === 0x85;
       const settingWrite = commandClass === 0x0b && commandId === 0x0b;
+      const calibWrite = commandClass === 0x0b && commandId === 0x03;
       // The real mouse refuses the pair write unless asymmetric mode is on, and
       // leaves it again whenever a tracking level is written.
-      if (settingWrite && data[10] === 0x04) state.asymmetric = data[11] === 0x01;
+      if (settingWrite && data[10] === 0x04) state.asymmetric = data[11] === (options.asymmetricArmValue ?? 0x01);
       if (settingWrite && data[10] === 0x01 && !options.ignoreWrites) {
         state.tracking = data[11];
         state.asymmetric = false;
       }
-      if (liftOffWrite && !state.asymmetric) {
+      if (calibWrite) calibratedOn = true;
+      if (liftOffWrite && (!state.asymmetric || (options.calibOnRequired && !calibratedOn))) {
         pending = replyPacket(commandClass, commandId, data[5], [], RAZER_STATUS.failure);
         return;
       }
@@ -162,6 +228,105 @@ test("an untested model that refuses the battery read still reports the rest", a
   assert.equal(status.pollingRateHz, 1000);
   // The panel should not present a transcribed model as a tested one.
   assert.match(status.connectionDetail ?? "", /untested model/);
+});
+
+test("the Viper V3 Pro publishes its stored DPI stages writably", async () => {
+  // The class `0x04`/`0x86` read is verified on hardware; the matching
+  // `0x04`/`0x06` write mirrors OpenRazer's kernel driver, so the table is
+  // published as fixed (`countEditable: false`) and editable: the app gates
+  // value and active-stage edits on the driver exposing `setDpiStageValue`
+  // and `setActiveDpiStage`.
+  // Arrange: the factory ladder with the third stage active (1-based 3).
+  const fake = fakeMouse(
+    { tracking: 1, liftOff: 10, landing: 5, asymmetric: true },
+    { dpiStages: { values: [400, 800, 1600, 3200, 6400], active: 3 } },
+  );
+
+  // Act
+  const status = await fake.client.readStatus();
+
+  // Assert
+  assert.deepEqual(status.dpiStages, [400, 800, 1600, 3200, 6400]);
+  assert.equal(status.activeDpiStage, 2, "the 1-based report becomes a 0-based index");
+  assert.deepEqual(status.ui?.dpiStageEditor, {
+    maxStages: 5,
+    countEditable: false,
+    minDpi: 100,
+    maxDpi: 35000,
+    stepDpi: 50,
+  });
+  assert.equal(typeof (fake.client as unknown as Record<string, unknown>).setDpiStageValue, "function");
+  assert.equal(typeof (fake.client as unknown as Record<string, unknown>).setActiveDpiStage, "function");
+});
+
+test("setDpiStageValue rewrites the whole table and confirms the one stage", async () => {
+  // The write carries every stage, so only the target stage may change and the
+  // active stage must survive untouched.
+  const fake = fakeMouse(
+    { tracking: 1, liftOff: 10, landing: 5, asymmetric: true },
+    { dpiStages: { values: [400, 800, 1600, 3200, 6400], active: 3 } },
+  );
+
+  const confirmed = await fake.client.setDpiStageValue(2, 2000);
+
+  assert.equal(confirmed, 2000);
+  const sentWrite = fake.sent.find((data) => data[6] === 0x04 && data[7] === 0x06);
+  assert.ok(sentWrite, "the stage-table write (`0x04`/`0x06`) was sent");
+  assert.equal(sentWrite?.at(5), 0x26, "the write mirrors the read's fixed 38-byte payload");
+  assert.deepEqual([...sliceArgs(sentWrite!, 0, 3)], [0x01, 0x03, 0x05], "storage, 1-based active, count");
+  // Stage 2's record carries the new 2000 in both axes.
+  const record = sliceArgs(sentWrite!, 3 + 2 * 7, 7);
+  assert.deepEqual([...record], [2, (2000 >> 8) & 0xff, 2000 & 0xff, (2000 >> 8) & 0xff, 2000 & 0xff, 0, 0]);
+
+  const status = await fake.client.readStatus();
+  assert.deepEqual(status.dpiStages, [400, 800, 2000, 3200, 6400]);
+  assert.equal(status.activeDpiStage, 2, "the untouched active stage stays put");
+});
+
+test("setActiveDpiStage moves the active stage and confirms it", async () => {
+  const fake = fakeMouse(
+    { tracking: 1, liftOff: 10, landing: 5, asymmetric: true },
+    { dpiStages: { values: [400, 800, 1600, 3200, 6400], active: 3 } },
+  );
+
+  const confirmed = await fake.client.setActiveDpiStage(4);
+
+  assert.equal(confirmed, 4);
+  const sentWrite = fake.sent.find((data) => data[6] === 0x04 && data[7] === 0x06);
+  assert.equal(sentWrite?.at(9), 5, "the write numbers the active stage from one");
+  const status = await fake.client.readStatus();
+  assert.equal(status.activeDpiStage, 4);
+  assert.deepEqual(status.dpiStages, [400, 800, 1600, 3200, 6400], "values are untouched");
+});
+
+test("a stage write the mouse does not store is reported, not trusted", async () => {
+  // The old table must hold if the write is refused, so both setters verify by
+  // reading the table back rather than believing the write's status.
+  const fake = fakeMouse(
+    { tracking: 1, liftOff: 10, landing: 5, asymmetric: true },
+    { dpiStages: { values: [400, 800, 1600, 3200, 6400], active: 3 }, ignoreWrites: true },
+  );
+  const client = fake.client as Record<string, unknown>;
+
+  await assert.rejects(() => (client.setDpiStageValue as (stage: number, dpi: number) => Promise<number>)(2, 2000), /kept/);
+  await assert.rejects(() => (client.setActiveDpiStage as (stage: number) => Promise<number>)(4), /stayed/);
+});
+
+test("a mouse that refuses the stage read still reports the rest", async () => {
+  // A transport that does not answer class `0x04`/`0x86` must cost no more
+  // than the absence of the stage editor — the same degradation `readLiftOff`
+  // gets — rather than throwing the status read.
+  // Arrange: the default fake turns the stage read into an unsupported reply.
+  const fake = fakeMouse({ tracking: 1, liftOff: 10, landing: 5, asymmetric: true });
+
+  // Act
+  const status = await fake.client.readStatus();
+
+  // Assert: DPI itself still reads, and no stage table or editor is offered.
+  assert.equal(status.dpi, 1600);
+  assert.equal(status.ui?.dpiStageEditor, undefined);
+  assert.equal(status.dpiStages, undefined);
+  assert.equal(status.activeDpiStage, undefined);
 });
 
 test("a reply left over from the previous command is re-read, not reported", async () => {
@@ -393,6 +558,53 @@ test("the lift-off write unlocks asymmetric mode first, then uses the captured f
   assert.deepEqual(confirmed, { tracking: "High", liftOff: 16, landing: 11 });
 });
 
+test("a unit that refuses the shipped arm accepts the canonical fallback", async () => {
+  // On the reporter's unit the documented 0x01 unlock still answers the armed
+  // pair write 0x03, across two sessions. The canonical 0x00 form is the first
+  // documented fallback, so the write must not give up after the first refusal.
+  // Arrange
+  const { client, sent } = fakeMouse({ tracking: 2, liftOff: 26, landing: 25, asymmetric: false }, { asymmetricArmValue: 0x00 });
+
+  // Act
+  const confirmed = await client.setLiftOff(16, 11);
+
+  // Assert
+  assert.deepEqual(confirmed, { tracking: "High", liftOff: 16, landing: 11 });
+  const arms = sent.filter((packet) => packet[6] === 0x0b && packet[7] === 0x0b);
+  assert.deepEqual([...arms[0].slice(8, 12)], [0x00, 0x04, 0x04, 0x01]);
+  assert.deepEqual([...arms[1].slice(8, 12)], [0x00, 0x04, 0x04, 0x00]);
+});
+
+test("a unit that refuses both unlock values takes the calibration step", async () => {
+  // The calib-mode-on step (`0x0b`/`0x03` `00 04 01`) precedes the unlock as
+  // the last-resort arm; on the swept firmware it is not required, so this is
+  // only exercised on a unit that refuses the pair write after either unlock.
+  // Arrange
+  const { client, sent } = fakeMouse({ tracking: 2, liftOff: 26, landing: 25, asymmetric: false }, { calibOnRequired: true });
+
+  // Act
+  const confirmed = await client.setLiftOff(16, 11);
+
+  // Assert
+  assert.deepEqual(confirmed, { tracking: "High", liftOff: 16, landing: 11 });
+  const calibration = sent.find((packet) => packet[6] === 0x0b && packet[7] === 0x03);
+  assert.ok(calibration, "the calibration arm was never sent");
+  assert.deepEqual([...calibration.slice(8, 11)], [0x00, 0x04, 0x01]);
+});
+
+test("a unit that refuses every arm reports the refused pair write", async () => {
+  // A unit that needs the calibration step but only honours the canonical arm
+  // defeats all three sequences; the refusal must surface as the class 0x0b
+  // command 0x05 status, not as a guessed message.
+  // Arrange
+  const { client, sent } = fakeMouse({ tracking: 2, liftOff: 26, landing: 25, asymmetric: false }, { calibOnRequired: true, asymmetricArmValue: 0x00 });
+
+  // Act / Assert
+  await assert.rejects(() => client.setLiftOff(16, 11), /Class 0x0b command 0x05 returned status 0x03/);
+  // Three arm sequences, the last ending in the pair write that was refused.
+  assert.equal(sent.length, 7);
+});
+
 test("landing is capped below lift-off rather than rejected", async () => {
   // Lowering lift-off past an already-set landing is ordinary use of a pair of
   // controls; the protocol layer would throw on the inverted pair.
@@ -524,13 +736,16 @@ test("the DeathAdder V2 is accepted on either interface shape", () => {
 });
 
 test("a nativeOnly model is never accepted, whatever the interface shape", () => {
-  // The DeathAdder V4 Pro 0x00be has its control channel on a collection the
-  // browser refuses to expose. A granted device may still enumerate through
-  // getDevices()/auto-reconnect, so isSupported must refuse it regardless.
+  // The Viper Ultimate wireless receiver 0x007b has its control channel on a
+  // collection the browser refuses to expose. A granted device may still
+  // enumerate through getDevices()/auto-reconnect, so isSupported must refuse
+  // it regardless. (The DeathAdder V4 Pro used to be this test's example —
+  // Razer's own live AvailableDevices.json now lists it, so it's no longer
+  // nativeOnly; see devices.ts.)
   // Arrange
   const mouse = {
     vendorId: 0x1532,
-    productId: 0x00be,
+    productId: 0x007b,
     collections: [{ usagePage: 0x01, usage: 0x02, featureReports: [], children: [] }],
   } as unknown as HIDDevice;
   const vendor = {
@@ -541,6 +756,26 @@ test("a nativeOnly model is never accepted, whatever the interface shape", () =>
   // Act / Assert
   assert.equal(RazerHidClient.isSupported(mouse), false);
   assert.equal(RazerHidClient.isSupported(vendor), false);
+});
+
+test("a native host's grouped interface is accepted alongside its other collections", () => {
+  // A native (hidapi) host groups every top-level collection an interface
+  // declares onto one HIDDevice, unlike WebHID which hands the Generic
+  // Desktop Mouse collection over alone. The DeathAdder V3 HyperSpeed's
+  // control interface answers Razer's commands despite also declaring a
+  // Consumer Control collection — see issue #112.
+  // Arrange
+  const grouped = {
+    vendorId: 0x1532,
+    productId: 0x00c4,
+    collections: [
+      { usagePage: 0x01, usage: 0x02, featureReports: [], children: [] },
+      { usagePage: 0x0c, usage: 0x01, featureReports: [], children: [] },
+    ],
+  } as unknown as HIDDevice;
+
+  // Act / Assert
+  assert.equal(RazerHidClient.isSupported(grouped), true);
 });
 
 test("the DeathAdder V2 caps DPI at 20000", () => {
@@ -568,4 +803,483 @@ test("the DeathAdder V2 DPI write uses the legacy transaction id and no-store by
   assert.equal(write[8], 0x00);
   assert.equal(confirm[1], 0x3f);
   assert.equal(confirm[8], 0x00);
+});
+
+/**
+ * Dock passthrough that answers only one polling command, the way a paired
+ * mouse that lacks (or has) HyperPolling does.
+ */
+function fakeDock(options: { extended: boolean }) {
+  let pending = new Uint8Array(RAZER_PACKET_LENGTH);
+  const device = {
+    vendorId: 0x1532,
+    productId: 0x00a4,
+    productName: "Razer Mouse Dock Pro",
+    opened: true,
+    collections: [{ usagePage: 0x01, usage: 0x02, children: [], featureReports: [], inputReports: [], outputReports: [] }],
+    open: async () => {},
+    close: async () => {},
+    sendFeatureReport: async (_reportId: number, data: Uint8Array) => {
+      const [commandClass, commandId] = [data[6], data[7]];
+      const answer = (dataSize: number, args: number[]) =>
+        replyPacket(commandClass, commandId, dataSize, args, RAZER_STATUS.ok);
+      if (commandClass === 0x00 && commandId === 0x81) pending = answer(0x02, [1, 3]);
+      else if (commandClass === 0x00 && commandId === 0x82) pending = answer(0x16, []);
+      else if (commandClass === 0x07 && commandId === 0x80) pending = answer(0x02, [0x00, 0x80]);
+      else if (commandClass === 0x07 && commandId === 0x84) pending = answer(0x02, [0x00, 0x00]);
+      else if (commandClass === 0x07 && commandId === 0x83) pending = answer(0x02, [0x00, 5]);
+      else if (commandClass === 0x07 && commandId === 0x81) pending = answer(0x02, [0x4d, 0x00]);
+      else if (commandClass === 0x04 && commandId === 0x85) pending = answer(0x07, [0x01, 0x06, 0x40, 0x06, 0x40]);
+      else if (commandClass === 0x00 && commandId === 0xc0) {
+        pending = options.extended
+          ? answer(0x02, [0x00, 8])
+          : replyPacket(commandClass, commandId, data[5], [], RAZER_STATUS.unsupported);
+      } else if (commandClass === 0x00 && commandId === 0x85) {
+        pending = options.extended
+          ? replyPacket(commandClass, commandId, data[5], [], RAZER_STATUS.unsupported)
+          : answer(0x01, [1]);
+      } else if (commandClass === 0x0b) {
+        pending = replyPacket(commandClass, commandId, data[5], [], RAZER_STATUS.unsupported);
+      } else {
+        pending = replyPacket(commandClass, commandId, data[5], [], RAZER_STATUS.unsupported);
+      }
+    },
+    receiveFeatureReport: async () => new DataView(pending.buffer.slice(0)),
+  } as unknown as HIDDevice;
+  return new RazerHidClient(device);
+}
+
+test("Mouse Dock Pro with a 1 kHz mouse stays on the legacy polling ladder", async () => {
+  const { RATES_1K } = await import("@openmouse/protocol/razer-devices");
+  const client = fakeDock({ extended: false });
+  const status = await client.readStatus();
+  assert.equal(status.connectionDetail, "Mouse Dock Pro");
+  assert.equal(status.pollingRateHz, 1000);
+  assert.deepEqual(status.supportedPollingRates, [...RATES_1K]);
+});
+
+test("Mouse Dock Pro with a HyperPolling mouse unlocks the 8 kHz ladder", async () => {
+  const { RATES_8K } = await import("@openmouse/protocol/razer-devices");
+  const client = fakeDock({ extended: true });
+  const status = await client.readStatus();
+  assert.equal(status.connectionDetail, "Mouse Dock Pro");
+  // Extended divisor of 8000 with value 8 → 1000 Hz reported, but the ladder
+  // still opens to 8 kHz because the command itself answered.
+  assert.equal(status.pollingRateHz, 1000);
+  assert.deepEqual(status.supportedPollingRates, [...RATES_8K]);
+});
+
+test("the wired DeathAdder V3 commits polling with selector 0x01 on the same transaction id", async () => {
+  // Issue #222: selector 0x00 alone is acknowledged and the read-back stays
+  // at the old rate. OpenRazer follows it with selector 0x01, still on 0x1f.
+  const { client, sent } = fakeMouse(
+    { tracking: 0, liftOff: 2, landing: 1, asymmetric: false },
+    { productId: 0x00b2 },
+  );
+
+  const confirmed = await client.setPollingRate(2000);
+
+  assert.equal(confirmed, 2000);
+  const writes = sent.filter((packet) => packet[6] === 0x00 && packet[7] === 0x40);
+  assert.equal(writes.length, 2);
+  assert.deepEqual([writes[0][1], writes[0][8], writes[0][9]], [0x1f, 0x00, 0x04]);
+  assert.deepEqual([writes[1][1], writes[1][8], writes[1][9]], [0x1f, 0x01, 0x04]);
+});
+
+test("the wireless Viper V3 Pro commits polling with selector 0x01 on the same transaction id", async () => {
+  // Issue #228: selector 0x00 alone applies to the live register, so the rate
+  // worked until the mouse powered off. OpenRazer follows it with selector 0x01
+  // on 0x1f for the store, matching the wired DeathAdder V3's commit.
+  const { client, sent } = fakeMouse(
+    { tracking: 0, liftOff: 2, landing: 1, asymmetric: false },
+  );
+
+  const confirmed = await client.setPollingRate(2000);
+
+  assert.equal(confirmed, 2000);
+  const writes = sent.filter((packet) => packet[6] === 0x00 && packet[7] === 0x40);
+  assert.equal(writes.length, 2);
+  assert.deepEqual([writes[0][1], writes[0][8], writes[0][9]], [0x1f, 0x00, 0x04]);
+  assert.deepEqual([writes[1][1], writes[1][8], writes[1][9]], [0x1f, 0x01, 0x04]);
+});
+
+test("HyperPolling dongle commits an 8 kHz change through both selectors", async () => {
+  const { client, sent } = fakeMouse(
+    { tracking: 0, liftOff: 2, landing: 1, asymmetric: false },
+    { productId: 0x00b3 },
+  );
+
+  await client.setPollingRate(8000);
+
+  assert.equal(sent.length, 3);
+  const [write, commit, confirm] = sent;
+  assert.deepEqual([write[1], write[6], write[7], write[8], write[9]], [0x1f, 0x00, 0x40, 0x00, 0x01]);
+  assert.deepEqual([commit[1], commit[6], commit[7], commit[8], commit[9]], [0xff, 0x00, 0x40, 0x01, 0x01]);
+  assert.deepEqual([confirm[1], confirm[6], confirm[7]], [0x1f, 0x00, 0xc0]);
+});
+
+test("a Chrome-refused feature-report write surfaces troubleshooting, not the bare DOMException", async () => {
+  // The reported Viper V3 Pro symptom — "failed to write feature report" — is
+  // Chrome's own `sendFeatureReport` rejection, which carries no explanation.
+  // The very first control command (the firmware read) hits it first, so the
+  // whole status read aborts: the read must surface what to do, not the bare
+  // string. Arrange: every write is refused, the way a Synapse-held control
+  // interface or a Chrome-protected mouse collection refuses them.
+  const device = {
+    vendorId: 0x1532,
+    productId: 0x00c1,
+    productName: "Razer Viper V3 Pro",
+    opened: true,
+    collections: [{ usagePage: 0x01, usage: 0x02, children: [], featureReports: [], inputReports: [], outputReports: [] }],
+    open: async () => {},
+    close: async () => {},
+    sendFeatureReport: async () => {
+      throw new DOMException("Failed to write feature report.", "NotAllowedError");
+    },
+    receiveFeatureReport: async () => new DataView(new Uint8Array(RAZER_PACKET_LENGTH).buffer),
+  } as unknown as HIDDevice;
+  const client = new RazerHidClient(device);
+
+  await assert.rejects(client.readStatus(), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /Viper V3 Pro/);
+    assert.match(error.message, /Failed to write feature report/);
+    assert.match(error.message, /Quit Razer Synapse/);
+    assert.match(error.message, /other Razer Viper interface/);
+    return true;
+  });
+});
+
+/**
+ * A Chroma-era wired mouse: firmware, DPI and legacy polling, plus the
+ * standard-matrix effect write and the backlight brightness pair (`0x03`).
+ * Brightness is held on the mouse's 0-255 scale; `ignoreWrites` acknowledges
+ * a brightness write and keeps the old level.
+ */
+function fakeChromaMouse(options: {
+  productId?: number;
+  brightness?: number;
+  ignoreWrites?: boolean;
+  failCustomFrame?: boolean;
+  failCustomEffect?: boolean;
+} = {}) {
+  const sent: Uint8Array[] = [];
+  let level = options.brightness ?? 0xff;
+  let pending = new Uint8Array(RAZER_PACKET_LENGTH);
+  const device = {
+    vendorId: 0x1532,
+    productId: options.productId ?? 0x004c,
+    productName: "Razer Diamondback Chroma",
+    opened: true,
+    collections: [{ usagePage: 0x01, usage: 0x02, children: [], featureReports: [], inputReports: [], outputReports: [] }],
+    open: async () => {},
+    close: async () => {},
+    sendFeatureReport: async (_reportId: number, data: Uint8Array) => {
+      sent.push(data);
+      const [commandClass, commandId] = [data[6], data[7]];
+      const answer = (dataSize: number, args: number[]) =>
+        replyPacket(commandClass, commandId, dataSize, args, RAZER_STATUS.ok);
+      if (commandClass === 0x00 && commandId === 0x81) pending = answer(0x02, [1, 0]);
+      else if (commandClass === 0x04 && commandId === 0x85) pending = answer(0x07, [0x01, 0x07, 0x08, 0x07, 0x08]);
+      else if (commandClass === 0x00 && commandId === 0x85) pending = answer(0x01, [2]);
+      else if (commandClass === 0x03 && commandId === 0x0c) {
+        pending = options.failCustomFrame
+          ? replyPacket(commandClass, commandId, data[5], [], RAZER_STATUS.unsupported)
+          : answer(data[5], [...data.slice(8, 8 + data[5])]);
+      } else if (commandClass === 0x03 && commandId === 0x0a) {
+        pending = options.failCustomEffect && data[8] === 0x05
+          ? replyPacket(commandClass, commandId, data[5], [], RAZER_STATUS.unsupported)
+          : answer(data[5], [...data.slice(8, 8 + data[5])]);
+      }
+      else if (commandClass === 0x03 && commandId === 0x03) {
+        if (!options.ignoreWrites) level = data[10];
+        pending = answer(0x03, [data[8], data[9], data[10]]);
+      } else if (commandClass === 0x03 && commandId === 0x83) pending = answer(0x03, [data[8], data[9], level]);
+      else pending = replyPacket(commandClass, commandId, data[5], [], RAZER_STATUS.unsupported);
+    },
+    receiveFeatureReport: async () => new DataView(pending.buffer.slice(0)),
+  } as unknown as HIDDevice;
+  return { client: new RazerHidClient(device), sent };
+}
+
+test("the Diamondback Chroma offers its lighting with the brightness it reports", async () => {
+  const { client } = fakeChromaMouse({ brightness: 0x80 });
+
+  const { lighting } = await client.readStatus();
+
+  assert.equal(lighting?.zone, "Mouse");
+  assert.ok(lighting?.modes.includes("Wave"));
+  assert.equal(lighting?.brightness, 50);
+  // The effect has no read, so nothing claims to know the running one.
+  assert.equal(lighting?.mode, null);
+  assert.equal(lighting?.writeOnly, true);
+});
+
+test("a Razer model off the lighting allowlist is never sent a lighting command", async () => {
+  // Arrange: 0x0043 is the DeathAdder Chroma, same generation, not listed.
+  const { client, sent } = fakeChromaMouse({ productId: 0x0043 });
+
+  const status = await client.readStatus();
+
+  assert.equal(status.lighting, undefined);
+  assert.equal(sent.some((packet) => packet[6] === 0x03), false);
+  await assert.rejects(
+    client.setLighting({ zone: "Mouse", mode: "Static", color: "#ffffff" } as MouseLighting),
+    /does not support changing the lighting/,
+  );
+  assert.equal(sent.some((packet) => packet[6] === 0x03), false);
+});
+
+test("the Diamondback exposes 21 unknown, write-only LED cells beside its whole-mouse effects", async () => {
+  const { client, sent } = fakeChromaMouse();
+  const status = await client.readStatus();
+  assert.equal(status.lightingZones?.length, 22);
+  assert.equal(status.lightingZones?.[0], status.lighting);
+  const cells = status.lightingZones!.slice(1);
+  assert.deepEqual(cells.map((cell) => cell.hardwareZoneId), Array.from({ length: 21 }, (_, i) => i));
+  for (const cell of cells) {
+    assert.equal(cell.mode, null);
+    assert.equal(cell.writeOnly, true);
+    assert.deepEqual(cell.modes, ["Off", "Static"]);
+    assert.equal(cell.brightnessLevels, undefined);
+  }
+  assert.equal(sent.some((packet) => packet[6] === 0x03 && packet[7] === 0x0c), false);
+});
+
+test("painting LED 20 uploads only that cell before activating the volatile custom frame", async () => {
+  const { client, sent } = fakeChromaMouse();
+  const status = await client.readStatus();
+  sent.length = 0;
+  await client.setLighting({ ...status.lightingZones![21], mode: "Static", color: "#123456" });
+  assert.deepEqual(sent.map((p) => [p[1], p[5], p[6], p[7]]), [[0xff, 0x32, 0x03, 0x0c], [0xff, 0x02, 0x03, 0x0a]]);
+  assert.deepEqual([...sliceArgs(sent[0], 0, 5)], [20, 20, 0x12, 0x34, 0x56]);
+  assert.deepEqual([...sliceArgs(sent[1], 0, 2)], [0x05, 0x00]);
+  const after = await client.readStatus();
+  assert.equal(after.lighting?.mode, null);
+  assert.equal(after.lightingZones![21].mode, "Static");
+  assert.equal(after.lightingZones![21].color, "#123456");
+  assert.equal(after.lightingZones![1].mode, null);
+});
+
+test("LED zero supports Off without overwriting other cells or global brightness", async () => {
+  const { client, sent } = fakeChromaMouse();
+  const zones = (await client.readStatus()).lightingZones!;
+  await client.setLighting({ ...zones[2], mode: "Static", color: "#abcdef" });
+  sent.length = 0;
+  await client.setLighting({ ...zones[1], mode: "Off", color: "#ff0000", brightness: 25 });
+  assert.equal(sent.length, 1);
+  assert.deepEqual([...sliceArgs(sent[0], 0, 5)], [0, 0, 0, 0, 0]);
+  const after = await client.readStatus();
+  assert.equal(after.lightingZones![1].mode, "Off");
+  assert.equal(after.lightingZones![2].color, "#abcdef");
+  assert.equal(after.lighting?.brightness, 100);
+});
+
+test("a whole-mouse effect clears the active LED modes and the next cell reactivates custom lighting", async () => {
+  const { client, sent } = fakeChromaMouse();
+  const zones = (await client.readStatus()).lightingZones!;
+  await client.setLighting({ ...zones[1], mode: "Static", color: "#abcdef" });
+  await client.setLighting({ ...zones[0], mode: "Spectrum" });
+  const after = await client.readStatus();
+  assert.equal(after.lighting?.mode, "Spectrum");
+  assert.ok(after.lightingZones!.slice(1).every((cell) => cell.mode === null));
+  sent.length = 0;
+  await client.setLighting({ ...after.lightingZones![2], mode: "Static", color: "#654321" });
+  assert.deepEqual(sent.map((p) => p[7]), [0x0c, 0x0a]);
+});
+
+test("failed frame uploads and activations never populate the write-only cache", async () => {
+  for (const failure of ["failCustomFrame", "failCustomEffect"] as const) {
+    const options = { [failure]: true };
+    const { client, sent } = fakeChromaMouse(options);
+    const zones = (await client.readStatus()).lightingZones!;
+    sent.length = 0;
+    await assert.rejects(client.setLighting({ ...zones[1], mode: "Static", color: "#123456" }));
+    assert.equal((await client.readStatus()).lightingZones![1].mode, null);
+    if (failure === "failCustomFrame") assert.equal(sent.some((p) => p[7] === 0x0a), false);
+    options[failure] = false;
+    sent.length = 0;
+    await client.setLighting({ ...zones[1], mode: "Static", color: "#123456" });
+    assert.deepEqual(sent.map((p) => p[7]), [0x0c, 0x0a]);
+  }
+});
+
+test("LED validation rejects unknown indices, mismatched zones, effects and colours before writing", async () => {
+  const { client, sent } = fakeChromaMouse();
+  const cell = (await client.readStatus()).lightingZones![1];
+  sent.length = 0;
+  for (const patch of [
+    { hardwareZoneId: -1 }, { hardwareZoneId: 21 }, { hardwareZoneId: 0.5 },
+    { hardwareZoneId: NaN }, { zone: "Logo" }, { mode: "Wave" as const },
+    { color: "no-colour" }, { color: null },
+  ]) {
+    await assert.rejects(client.setLighting({ ...cell, mode: "Static", color: "#112233", ...patch }));
+  }
+  assert.equal(sent.length, 0);
+  const other = fakeChromaMouse({ productId: 0x006c });
+  await assert.rejects(other.client.setLighting({ ...cell, mode: "Static" }), /individual LED zone/);
+  assert.equal(other.sent.length, 0);
+});
+
+test("concurrent LED writes keep the upload and activation together", async () => {
+  const { client, sent } = fakeChromaMouse();
+  const zones = (await client.readStatus()).lightingZones!;
+  sent.length = 0;
+  await Promise.all([
+    client.setLighting({ ...zones[1], mode: "Static", color: "#112233" }),
+    client.setLighting({ ...zones[2], mode: "Static", color: "#445566" }),
+  ]);
+  assert.deepEqual(sent.map((p) => p[7]), [0x0c, 0x0a, 0x0c]);
+  const after = await client.readStatus();
+  assert.equal(after.lightingZones![1].color, "#112233");
+  assert.equal(after.lightingZones![2].color, "#445566");
+});
+
+test("an effect change sends one standard-matrix write and leaves an unchanged brightness alone", async () => {
+  const { client, sent } = fakeChromaMouse();
+  const { lighting } = await client.readStatus();
+  sent.length = 0;
+
+  await client.setLighting({ ...lighting!, mode: "Static", color: "#ff8000" });
+
+  // On the product's own 0xff id, not the driver default.
+  assert.deepEqual(sent.map((packet) => [packet[1], packet[6], packet[7]]), [[0xff, 0x03, 0x0a]]);
+  assert.deepEqual([...sliceArgs(sent[0], 0, 4)], [0x06, 0xff, 0x80, 0x00]);
+  // Write-only: the next status read reports the cached effect.
+  assert.equal((await client.readStatus()).lighting?.mode, "Static");
+});
+
+test("a brightness change is written to the backlight and confirmed by reading it back", async () => {
+  const { client, sent } = fakeChromaMouse();
+  const { lighting } = await client.readStatus();
+  sent.length = 0;
+
+  const result = await client.setLighting({ ...lighting!, mode: "Spectrum", brightness: 50 });
+
+  assert.deepEqual(sent.map((packet) => [packet[6], packet[7]]), [[0x03, 0x0a], [0x03, 0x03], [0x03, 0x83]]);
+  assert.deepEqual([...sliceArgs(sent[1], 0, 3)], [0x01, 0x05, 0x80]);
+  assert.equal(result.brightness, 50);
+});
+
+test("a brightness the mouse does not keep is reported, and the effect it did take stays cached", async () => {
+  const { client } = fakeChromaMouse({ ignoreWrites: true });
+  const { lighting } = await client.readStatus();
+
+  await assert.rejects(
+    client.setLighting({ ...lighting!, mode: "Spectrum", brightness: 50 }),
+    /kept 100% brightness instead of 50%/,
+  );
+
+  const after = (await client.readStatus()).lighting;
+  assert.equal(after?.mode, "Spectrum");
+  assert.equal(after?.brightness, 100);
+});
+
+/**
+ * A Basilisk V3: firmware, DPI and legacy polling, plus the extended-matrix
+ * effect write and per-led brightness pair (`0x0f`), all of which it answers
+ * only on transaction id `0x1f`. Brightness is held per led on the 0-255
+ * scale; `ignoreWrites` acknowledges a brightness write and keeps the level.
+ */
+function fakeBasiliskV3(options: { productId?: number; ignoreWrites?: boolean } = {}) {
+  const sent: Uint8Array[] = [];
+  const levels = new Map<number, number>([[0x00, 0xff], [0x01, 0x80], [0x04, 0x40]]);
+  let pending = new Uint8Array(RAZER_PACKET_LENGTH);
+  const device = {
+    vendorId: 0x1532,
+    productId: options.productId ?? 0x0099,
+    productName: "Razer Basilisk V3",
+    opened: true,
+    collections: [{ usagePage: 0x01, usage: 0x02, children: [], featureReports: [], inputReports: [], outputReports: [] }],
+    open: async () => {},
+    close: async () => {},
+    sendFeatureReport: async (_reportId: number, data: Uint8Array) => {
+      sent.push(data);
+      const [transactionId, commandClass, commandId] = [data[1], data[6], data[7]];
+      const answer = (dataSize: number, args: number[]) =>
+        replyPacket(commandClass, commandId, dataSize, args, RAZER_STATUS.ok);
+      if (commandClass === 0x00 && commandId === 0x81) pending = answer(0x02, [1, 0]);
+      else if (commandClass === 0x04 && commandId === 0x85) pending = answer(0x07, [0x01, 0x07, 0x08, 0x07, 0x08]);
+      else if (commandClass === 0x00 && commandId === 0x85) pending = answer(0x01, [2]);
+      else if (commandClass === 0x0f && transactionId !== 0x1f) {
+        // The real mouse stays silent on a wrong id; a stale reply models that.
+        pending = replyPacket(commandClass, commandId, data[5], [], RAZER_STATUS.unsupported);
+      } else if (commandClass === 0x0f && commandId === 0x02) pending = answer(data[5], [...data.slice(8, 8 + data[5])]);
+      else if (commandClass === 0x0f && commandId === 0x04) {
+        if (!options.ignoreWrites) levels.set(data[9], data[10]);
+        pending = answer(0x03, [data[8], data[9], data[10]]);
+      } else if (commandClass === 0x0f && commandId === 0x84) pending = answer(0x03, [data[8], data[9], levels.get(data[9]) ?? 0]);
+      else pending = replyPacket(commandClass, commandId, data[5], [], RAZER_STATUS.unsupported);
+    },
+    receiveFeatureReport: async () => new DataView(pending.buffer.slice(0)),
+  } as unknown as HIDDevice;
+  return { client: new RazerHidClient(device), sent };
+}
+
+test("the Basilisk V3 offers three extended-matrix zones with each led's brightness", async () => {
+  const { client, sent } = fakeBasiliskV3();
+
+  const status = await client.readStatus();
+
+  assert.deepEqual(status.lightingZones?.map((zone) => zone.zone), ["Mouse", "Scroll wheel", "Logo"]);
+  assert.deepEqual(status.lightingZones?.map((zone) => zone.brightness), [100, 50, 25]);
+  assert.deepEqual(status.lightingZones?.[0].modes, ["Off", "Spectrum", "Wave", "Static"]);
+  assert.equal(status.lightingZones?.[0].writeOnly, true);
+  // `lighting` stays the first zone for callers that predate zones.
+  assert.equal(status.lighting?.zone, "Mouse");
+  // Every lighting read went out on 0x1f, to the all, scroll and logo leds.
+  const reads = sent.filter((packet) => packet[6] === 0x0f);
+  assert.deepEqual(reads.map((packet) => [packet[1], packet[7], packet[9]]), [[0x1f, 0x84, 0x00], [0x1f, 0x84, 0x01], [0x1f, 0x84, 0x04]]);
+});
+
+test("a Basilisk V3 zone write goes to that zone's led on 0x1f", async () => {
+  const { client, sent } = fakeBasiliskV3();
+  const zones = (await client.readStatus()).lightingZones!;
+  sent.length = 0;
+
+  await client.setLighting({ ...zones[1], mode: "Static", color: "#ff8000" });
+  await client.setLighting({ ...zones[2], mode: "Wave" });
+
+  assert.deepEqual(sent.map((packet) => [packet[1], packet[6], packet[7]]), [[0x1f, 0x0f, 0x02], [0x1f, 0x0f, 0x02]]);
+  assert.deepEqual([...sliceArgs(sent[0], 0, 9)], [0x01, 0x01, 0x01, 0x00, 0x00, 0x01, 0xff, 0x80, 0x00]);
+  assert.deepEqual([...sliceArgs(sent[1], 0, 6)], [0x01, 0x04, 0x04, 0x01, 0x28, 0x00]);
+  // Write-only: the next status read reports each zone's cached effect.
+  const after = (await client.readStatus()).lightingZones!;
+  assert.deepEqual(after.map((zone) => zone.mode), [null, "Static", "Wave"]);
+});
+
+test("a Basilisk V3 brightness change is written to that led and confirmed by reading it back", async () => {
+  const { client, sent } = fakeBasiliskV3();
+  const zones = (await client.readStatus()).lightingZones!;
+  sent.length = 0;
+
+  const result = await client.setLighting({ ...zones[0], mode: "Spectrum", brightness: 50 });
+
+  assert.deepEqual(sent.map((packet) => [packet[7], packet[9]]), [[0x02, 0x00], [0x04, 0x00], [0x84, 0x00]]);
+  assert.deepEqual([...sliceArgs(sent[1], 0, 3)], [0x01, 0x00, 0x80]);
+  assert.equal(result.brightness, 50);
+  assert.equal((await client.readStatus()).lightingZones?.[0].brightness, 50);
+});
+
+test("a Basilisk V3 brightness the mouse does not keep is reported and the effect stays cached", async () => {
+  const { client } = fakeBasiliskV3({ ignoreWrites: true });
+  const zones = (await client.readStatus()).lightingZones!;
+
+  await assert.rejects(
+    client.setLighting({ ...zones[2], mode: "Spectrum", brightness: 50 }),
+    /kept 25% brightness instead of 50%/,
+  );
+
+  const after = (await client.readStatus()).lightingZones![2];
+  assert.equal(after.mode, "Spectrum");
+  assert.equal(after.brightness, 25);
+});
+
+test("a Basilisk V3 refuses a zone it does not have", async () => {
+  const { client, sent } = fakeBasiliskV3();
+  const zones = (await client.readStatus()).lightingZones!;
+  sent.length = 0;
+
+  await assert.rejects(client.setLighting({ ...zones[0], zone: "Underglow", mode: "Static" }), /no "Underglow" lighting zone/);
+  assert.equal(sent.length, 0);
 });

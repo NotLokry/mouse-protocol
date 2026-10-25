@@ -9,11 +9,13 @@ import {
   eggClampCpi,
   eggDecodeButtonAction,
   eggDpiOptions,
+  eggExposedFeatures,
   eggEncodeButtonAction,
   eggFormatFirmwareVersion,
   eggIsValidCpi,
   eggLodOptions,
   eggNormalizeFeatureReport,
+  eggProfileForPid,
   eggReadUint16LE,
   eggWriteEnabledCpiStages,
 } from "@openmouse/protocol/endgame-gear-op1";
@@ -22,12 +24,33 @@ const op1 = EGG_DEVICE_PROFILES.get(0x1964)!;
 const purple = EGG_DEVICE_PROFILES.get(0x1976)!;
 const op1v2 = EGG_DEVICE_PROFILES.get(0x1978)!;
 
-test("all five Endgame Gear 8K devices have explicit capability profiles", () => {
-  assert.deepEqual([...EGG_DEVICE_PROFILES.keys()], [0x1964, 0x1966, 0x1976, 0x1978, 0x1980]);
+test("all ten Endgame Gear OP1-protocol devices have explicit capability profiles", () => {
+  assert.deepEqual(
+    [...EGG_DEVICE_PROFILES.keys()],
+    [0x1964, 0x1966, 0x1976, 0x1978, 0x1980, 0x1972, 0x1968, 0x1984, 0x1982, 0x1970],
+  );
   assert.equal(op1.motionSyncAt8k, false);
   assert.equal(EGG_DEVICE_PROFILES.get(0x1966)!.motionSyncAt8k, false);
   assert.equal(purple.motionSyncAt8k, true);
   assert.equal(op1v2.motionSyncAt8k, true);
+});
+
+test("OP1w 4K v2 wireless models are capped at 4000 Hz while wired 8K models keep 8000 Hz", () => {
+  assert.equal(op1.maxPollingHz, 8000);
+  assert.equal(op1v2.maxPollingHz, 8000);
+  assert.equal(EGG_DEVICE_PROFILES.get(0x1984)!.maxPollingHz, 4000);
+  assert.equal(EGG_DEVICE_PROFILES.get(0x1982)!.maxPollingHz, 4000);
+  assert.equal(EGG_DEVICE_PROFILES.get(0x1970)!.maxPollingHz, 4000);
+});
+
+test("cabled 4K PIDs name their model; the shared dongle stays neutral until the mouse reports its PID", () => {
+  // An XM2w 4K v2 behind the dongle reports the receiver's fixed USB name
+  // (confirmed on hardware), so 0x1970 alone cannot say which mouse is paired.
+  assert.equal(eggProfileForPid(0x1972).name, "Endgame Gear OP1w 4K");
+  assert.equal(eggProfileForPid(0x1968).name, "Endgame Gear XM2w 4K");
+  assert.equal(eggProfileForPid(0x1984).name, "Endgame Gear OP1w 4K v2");
+  assert.equal(eggProfileForPid(0x1982).name, "Endgame Gear XM2w 4K v2");
+  assert.equal(eggProfileForPid(0x1970).name, "Endgame Gear OP1w/XM2w 4K");
 });
 
 test("CPI ranges and quantization follow each sensor generation", () => {
@@ -138,4 +161,32 @@ test("all supported button actions round-trip through the wire codec", () => {
     assert.deepEqual(eggEncodeButtonAction(eggDecodeButtonAction(encoded.type, encoded.params)), encoded);
   }
   assert.deepEqual(eggEncodeButtonAction({ key: "cpi-loop" })!.params, [0xf1, 0, 0, 0, 0]);
+});
+
+test("each K26/W26 device lists its exposed features", () => {
+  const base = [
+    "dpi-stages", "polling-rate", "lift-off-distance", "motion-sync",
+    "angle-snapping", "ripple-control", "slamclick-filter", "spdt-mode",
+    "cpi-levels", "multiclick-filter", "button-mapping", "left-handed-mode",
+    "factory-reset", "firmware-version",
+  ];
+  const v1 = EGG_DEVICE_PROFILES.get(0x1964)!;
+  assert.deepEqual(eggExposedFeatures(v1), [...base, "motion-jitter-filter"]);
+  const purple = EGG_DEVICE_PROFILES.get(0x1976)!;
+  assert.deepEqual(
+    eggExposedFeatures(purple),
+    [...base, "glass-mode", "motion-jitter-filter"],
+  );
+  const v2 = EGG_DEVICE_PROFILES.get(0x1978)!;
+  assert.deepEqual(
+    eggExposedFeatures(v2),
+    [...base, "glass-mode", "sensor-angle-tuning", "force-max-fps", "led-lift-off", "motion-jitter-filter"],
+  );
+  const w4k = EGG_DEVICE_PROFILES.get(0x1972)!;
+  assert.deepEqual(eggExposedFeatures(w4k), [...base, "motion-jitter-filter"]);
+  const w4kv2 = EGG_DEVICE_PROFILES.get(0x1984)!;
+  assert.deepEqual(
+    eggExposedFeatures(w4kv2),
+    [...base, "glass-mode", "sensor-angle-tuning", "force-max-fps", "led-lift-off"],
+  );
 });

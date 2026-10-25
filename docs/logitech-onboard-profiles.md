@@ -404,9 +404,13 @@ Slot count and DPI range are properties of the mouse, not of the app: an older
 format can hold fewer slots over a much narrower range, and base v1 has no
 stage table at all. `dpiStages` is therefore `null` for every format whose
 numbers were never captured, and the UI hides the slot editor rather than
-borrowing format 7's limits. Format 8 almost certainly holds five slots, since
-it shares the v6 stage table, but its sensor range is unknown — so it is left
-null rather than half-guessed.
+borrowing format 7's limits. Format 8 holds five slots: a PRO X 3 Superstrike
+diagnostic (PRO X 2 identical) decodes its profile sector 1 to five stages
+(800/1200/1600/2400/3200, lift-off byte 2) at the v6 stage table, and the full
+255-byte sector matches its own stored CRC (0x2a38). The storage grid is the
+widest seen, 100-48000 (the X3's 0x2202 list), narrowed at runtime to the
+connected sensor. Format 8 is verified and, as a testing-phase step, writable, including the
+per-stage lift-off byte.
 
 Format 8 is taken to be the Superstrike format because it is the only one
 carrying the analog-button block, which is that mouse's distinguishing feature.
@@ -419,7 +423,11 @@ fact: capture the same G HUB diff on another format before trusting it.
 
 Transport limits stay where they are. The Superstrike's 1 kHz cap over USB is a
 property of that USB interface, not of its profile format, so it is still keyed
-on the product id.
+on the product id - now on the mouse's own reported USB transport id, through
+`reportRateCapabilitiesFor`. The PRO X 3 Superstrike (C0A9) shares format 8 but
+not the cap: on the cable its 0x8061 feature advertises every rate through 8000
+Hz (mask 0x7f, the same as wirelessly), so its cable ceiling is lifted to 8000.
+The PRO X 2 (C0A8) keeps 1 kHz until it shows the same.
 
 ### Per-format additions
 
@@ -574,6 +582,22 @@ stages them into a single pending-change group for the same reason.
 layout, so it is the Superstrike; a Superlight 2 is most likely 7, but that is a
 guess until read from hardware.
 
+**The original G Pro X Superlight (PID `0xc094`, wpid `4093` — "PRO X Wireless"
+in Logitech's/Solaar's naming) reports format 4, not the format 7 this layout
+was verified on.** A sector-1 dump from a real unit (main app
+`MPM25.01_B0018`) answered `getOnboardProfilesInfo` with format 4, five
+profiles, 16 sectors of 255 bytes, and a CRC-valid base-v1 sector 1: the
+scalar table at `0x03`, 800 DPI in the first slot, report interval `0x01` at
+`0x00`. Base v1 stores one scalar DPI per slot and has no per-stage lift-off
+byte at all, so the format-7 `0x05` ("Logitech internal error") report that
+originally motivated a product guard does not describe this layout. The
+captured geometry is pinned by the "PRO X Wireless dump" test in
+`onboard-profiles.test.ts`. `isLodWritableForProduct` keeps the product guard
+only for a unit that ever reports a v6 format, where a per-stage lift-off byte
+exists and was reported to be rejected; on the actual base-v1 device there is
+nothing to refuse. Everything else a profile carries — DPI, report rate,
+angle-snap, name and buttons — is writable.
+
 **Names for format ids 7 and 8**, and the meaning of the extra
 component-specific prototype fields (for example `dpi_v6` carries
 `0, 1, 2, 5, 5, 0, 2, 4` after offset and size — plausibly stage count, stride
@@ -674,8 +698,53 @@ is already set, so re-selecting the current option is free. These are
 user-driven toggles clicked occasionally, so wear is not a practical concern —
 but nothing should ever write them in a loop or on a restore path.
 
+**HITS mice have no LightForce switches.** The PRO X 2 and PRO X 3 Superstrike use
+HITS (feature 0x1B0C, an inductive analog trigger) instead of the hybrid
+optical/mechanical switches of the PRO X SUPERLIGHT 2 and G502 X. Their Mode Status
+(0x8090, version 3) still reads a byte that decodes to "Optical", but a LightForce
+write is rejected. Captured on a PRO X 3 over the cable (feature index 0x1C):
+`FF 1C 15 | 00 03 00 01` is answered by `FF FF 1C 15 02`, HID++ error 2
+(INVALID_ARGUMENT). So `lightforceSwitchMode` is reported only when HITS is absent,
+and `setModeStatus` refuses a LightForce change on a HITS mouse. Gaming surface is
+unchanged: whether the Superstrike accepts it has not been tested. G HUB also asks
+this feature a second question (function 2) that OpenMouse does not; the X3 answers
+`00 08`, which is not yet decoded.
+
 ### Other formats
 
 Offsets are format-specific; never apply one format's layout to another. Only
 ship writes for devices tested on real hardware. Decoding and dumping other
 formats is safe; writing on inference is not.
+
+### HITS settings are stored in the profile (format 8)
+
+The HITS tuning feature (0x1B0C) only changes the mouse's working values. What it
+loads at power-on is the profile's `analog_button` block at offset 0x26: one
+three-byte entry per primary button, holding the same bytes the live feature
+uses (`actuation << 2`, `rapid trigger << 2 | on`, `haptics << 2`). Three PRO X 3
+Superstrike captures show it: the stored block read `14 08 0c 14 08 0c` every
+time (actuation 5, sensitivity 2 off, haptics 3) while the live values differed
+and while a live-only apply came back to it after a power cycle. A HITS change
+is therefore written both ways: the live feature for immediate effect, and
+`persistAnalogButtonTuning` for the profile, in one sector write.
+
+## Factory reset and blank-mouse setup (format 8)
+
+Captured over USB (USBPcap) while G HUB reset every profile on a linked PRO X 3
+SUPERSTRIKE:
+
+- Each of sectors 1 to 5 received the same 255-byte image, CRC `0x2a38`. It is
+  byte-identical to the format 8 sector in the tests, including the HITS defaults
+  (actuation 5, rapid trigger 2 off, haptics 3).
+- The directory (sector 0) was written once: `00 01 01 ff | 00 02 00 ff | 00 03 00 ff |
+  00 04 00 ff | 00 05 00 ff`, then `ff` to the end, CRC `0x4037`. Sector 1 is
+  enabled, 2 to 5 disabled. It was byte-identical to the directory before the reset,
+  so a reset does not change the directory.
+- G HUB then selected profile 1 (`setCurrentProfile 00 01`).
+
+`resetAllOnboardProfiles` uses this image for format 8, so the X3 can be reset from
+OpenMouse. `initializeBlankOnboardProfiles` writes the same end state to a mouse
+whose directory lists no profiles (a mouse G HUB has never linked): the five
+sectors first, the directory last, then profile 1 selected, each read back. The
+write sequence is the one captured from a reset; it has not been run against a
+never-linked mouse, and G HUB's own first-link sequence was not captured.

@@ -15,6 +15,34 @@ export interface EggButtonAction {
 }
 
 export const EGG_VENDOR_ID = 0x3367;
+/** The 2.4 GHz dongle shared by every OP1w/XM2w 4K, v1 and v2. */
+export const EGG_4K_DONGLE_PID = 0x1970;
+
+/**
+ * Settings OpenMouse can read and write on a K26/W26 mouse. Per-device
+ * differences (glass mode, v2 sensor controls, jitter filter) are resolved
+ * by eggExposedFeatures(); polling/LOD/CPI ranges live on the profile.
+ */
+export type EggExposedFeature =
+  | "dpi-stages"
+  | "polling-rate"
+  | "lift-off-distance"
+  | "glass-mode"
+  | "sensor-angle-tuning"
+  | "force-max-fps"
+  | "led-lift-off"
+  | "motion-sync"
+  | "angle-snapping"
+  | "ripple-control"
+  | "slamclick-filter"
+  | "motion-jitter-filter"
+  | "spdt-mode"
+  | "cpi-levels"
+  | "multiclick-filter"
+  | "button-mapping"
+  | "left-handed-mode"
+  | "factory-reset"
+  | "firmware-version";
 
 export type EggSensorFamily = "paw3395" | "paw3950";
 export type EggConfigFamily = "v1" | "v2";
@@ -31,6 +59,16 @@ export interface EggDeviceProfile {
   lodNormal: readonly string[];
   lodGlass: readonly string[] | null;
   motionSyncAt8k: boolean;
+  /** Wired 8K models top out at 8000 Hz; wireless dongles are RF-limited to 4000 Hz. */
+  maxPollingHz: number;
+  /**
+   * OP1w/XM2w 4K firmware, both generations: refuses the whole-blob store
+   * (status 0x07) and takes block writes instead (eggBlockWrites). On v2
+   * (configFamily "v2") angle tuning and force max FPS sit at their own
+   * offsets and glass-mode LOD is whole millimetres; v1 stores every LOD in
+   * whole millimetres and has no glass mode.
+   */
+  wireless4k?: true;
 }
 
 const LOD_V1 = ["0.7 mm", "1 mm", "2 mm"] as const;
@@ -39,6 +77,35 @@ const LOD_V2 = [
   "1.3 mm", "1.4 mm", "1.5 mm", "1.6 mm", "1.7 mm",
 ] as const;
 const LOD_GLASS = ["1.0 mm", "2.0 mm"] as const;
+/** The 4K v1 tool offers only these, stored as wire values 1 and 2 (re/PROTOCOL.md section 12). */
+const LOD_4K_V1 = ["1 mm", "2 mm"] as const;
+/** OP1w 4K / XM2w 4K, the first generation: PAW3395 limits, no glass mode, no v2 sensor controls. */
+const WIRELESS_4K_V1 = {
+  configFamily: "v1",
+  sensorFamily: "paw3395",
+  cpiMin: 50,
+  cpiMax: 26_000,
+  cpiStepLow: 50,
+  cpiStepHigh: 50,
+  lodNormal: LOD_4K_V1,
+  lodGlass: null,
+  motionSyncAt8k: true,
+  maxPollingHz: 4000,
+  wireless4k: true,
+} as const;
+const WIRELESS_4K_V2 = {
+  configFamily: "v2",
+  sensorFamily: "paw3950",
+  cpiMin: 10,
+  cpiMax: 30_000,
+  cpiStepLow: 10,
+  cpiStepHigh: 50,
+  lodNormal: LOD_V2,
+  lodGlass: LOD_GLASS,
+  motionSyncAt8k: true,
+  maxPollingHz: 4000,
+  wireless4k: true,
+} as const;
 
 export const EGG_DEVICE_PROFILES: ReadonlyMap<number, EggDeviceProfile> = new Map([
   [0x1964, {
@@ -53,6 +120,7 @@ export const EGG_DEVICE_PROFILES: ReadonlyMap<number, EggDeviceProfile> = new Ma
     lodNormal: LOD_V1,
     lodGlass: null,
     motionSyncAt8k: false,
+    maxPollingHz: 8000,
   }],
   [0x1966, {
     pid: 0x1966,
@@ -66,6 +134,7 @@ export const EGG_DEVICE_PROFILES: ReadonlyMap<number, EggDeviceProfile> = new Ma
     lodNormal: LOD_V1,
     lodGlass: null,
     motionSyncAt8k: false,
+    maxPollingHz: 8000,
   }],
   [0x1976, {
     pid: 0x1976,
@@ -79,6 +148,7 @@ export const EGG_DEVICE_PROFILES: ReadonlyMap<number, EggDeviceProfile> = new Ma
     lodNormal: LOD_V1,
     lodGlass: LOD_GLASS,
     motionSyncAt8k: true,
+    maxPollingHz: 8000,
   }],
   [0x1978, {
     pid: 0x1978,
@@ -92,6 +162,7 @@ export const EGG_DEVICE_PROFILES: ReadonlyMap<number, EggDeviceProfile> = new Ma
     lodNormal: LOD_V2,
     lodGlass: LOD_GLASS,
     motionSyncAt8k: true,
+    maxPollingHz: 8000,
   }],
   [0x1980, {
     pid: 0x1980,
@@ -105,7 +176,21 @@ export const EGG_DEVICE_PROFILES: ReadonlyMap<number, EggDeviceProfile> = new Ma
     lodNormal: LOD_V2,
     lodGlass: LOD_GLASS,
     motionSyncAt8k: true,
+    maxPollingHz: 8000,
   }],
+  // OP1w/XM2w 4K, v1 and v2: the wireless models on the OP1-8K config protocol.
+  // Cabled, each mouse has its own PID (OP1w 4K 0x1972, XM2w 4K 0x1968, OP1w
+  // 4K v2 0x1984, XM2w 4K v2 0x1982; both XM2w from the vendor binaries only,
+  // re/PROTOCOL.md section 10). The 2.4 GHz dongle is 0x1970 for all four,
+  // reused from the older, unrelated OP1we (see egg-we-hid.ts, which uses the
+  // descriptor to keep the two drivers apart, issue #107), and its USB name is
+  // fixed whatever mouse is paired. Its profile stays neutral until the
+  // mouse-info command (EGG_OPERATION.mouseInfo) reports which one.
+  [0x1972, { pid: 0x1972, name: "Endgame Gear OP1w 4K", ...WIRELESS_4K_V1 }],
+  [0x1968, { pid: 0x1968, name: "Endgame Gear XM2w 4K", ...WIRELESS_4K_V1 }],
+  [0x1984, { pid: 0x1984, name: "Endgame Gear OP1w 4K v2", ...WIRELESS_4K_V2 }],
+  [0x1982, { pid: 0x1982, name: "Endgame Gear XM2w 4K v2", ...WIRELESS_4K_V2 }],
+  [EGG_4K_DONGLE_PID, { pid: EGG_4K_DONGLE_PID, name: "Endgame Gear OP1w/XM2w 4K", ...WIRELESS_4K_V2 }],
 ]);
 
 export const EGG_REPORT = {
@@ -119,6 +204,11 @@ export const EGG_OPERATION = {
   store: 0x11,
   load: 0x12,
   factoryReset: 0x13,
+  writeSensor: 0x14,
+  writePower: 0x15,
+  writeButtons: 0x16,
+  /** 4K v2: the mouse's own VID/PID and firmware, answered by the mouse even through the dongle. */
+  mouseInfo: 0x0e,
 } as const;
 
 export const EGG_OFFSET = {
@@ -139,6 +229,51 @@ export const EGG_OFFSET = {
   forceMaxFps: 129,
 } as const;
 
+/** Where the wireless4k firmware keeps fields that differ from EGG_OFFSET. */
+export const EGG_4K_OFFSET = {
+  angleTuning: 17,
+  /** Force max FPS is a filterFlags bit here, not a byte. */
+  forceMaxFpsFlag: 0x40,
+  /** The polling byte is a vendor enum here; this one is 1000 Hz with wireless power saving. */
+  powerSavePolling: 0x80,
+} as const;
+
+/** The only rates the 4K v2 vendor tool writes; 125 Hz is its "Office Mode" (0x40). */
+export const EGG_4K_POLLING_RATES = [125, 1000, 2000, 4000] as const;
+/** The 4K v1 tool writes only 0x08 / 0x04 / 0x02; Office Mode and power saving came with v2. */
+export const EGG_4K_V1_POLLING_RATES = [1000, 2000, 4000] as const;
+
+export interface EggBlockWrite {
+  command: number;
+  declaredLength: number;
+  /** 1-based chunk index for the two halves of the button table, else 0. */
+  chunk: number;
+  payload: Uint8Array;
+}
+
+/**
+ * The three block writes the OP1w/XM2w 4K vendor tools use instead of the
+ * whole-blob store, built from a config buffer. Layout decoded from the vendor
+ * tool and USB captures in johanneszab/endgame-op1w (re/PROTOCOL.md section 4);
+ * its blob offsets sit 16 bytes into our buffer. The power block declares 10
+ * bytes; the v2 tool appends an 11th, glass mode, which the v1 never sends.
+ */
+export function eggBlockWrites(config: Uint8Array, hasGlassMode = true): EggBlockWrite[] {
+  const at = (offset: number): number => config[16 + offset];
+  const sensor = new Uint8Array(28);
+  sensor.set([at(0x07), at(0x08), at(0x09), at(0x0a), at(0x0b), at(0x01), at(0x0e), at(0x0d)]);
+  sensor.set(config.subarray(16 + 0x23, 16 + 0x37), 8);
+  const filters = [0, 1, 2, 3, 4].map((button) => at(0x3d + button * 7));
+  const power = Uint8Array.of(at(0x0c), at(0x05), at(0x06), at(0x04), ...filters, at(0x03), ...(hasGlassMode ? [at(0x6f)] : []));
+  const buttons = config.slice(16 + 0x37, 16 + 0x6f);
+  return [
+    { command: EGG_OPERATION.writeSensor, declaredLength: 28, chunk: 0, payload: sensor },
+    { command: EGG_OPERATION.writePower, declaredLength: 10, chunk: 0, payload: power },
+    { command: EGG_OPERATION.writeButtons, declaredLength: 28, chunk: 1, payload: buttons.subarray(0, 28) },
+    { command: EGG_OPERATION.writeButtons, declaredLength: 28, chunk: 2, payload: buttons.subarray(28) },
+  ];
+}
+
 export const EGG_CONFIG_SIZE = 1041;
 export const EGG_COMMAND_SIZE = 64;
 export const EGG_POLLING_RATES = [125, 250, 500, 1000, 2000, 4000, 8000] as const;
@@ -153,10 +288,15 @@ export function eggNormalizeFeatureReport(
   // config size. On Windows, command replies then retain their A0/A1 wire
   // header as the first payload byte. Treat that byte as framing instead of
   // prepending a duplicate report ID and shifting the status/version fields.
+  // Status byte values observed on the wire (issue #107): 0x01 OK, 0x03 busy,
+  // 0x07 rejected, 0x08 mouse unreachable (RF sleep). All four are valid
+  // framing markers, not just OK/busy — treating only 0x01/0x03 as framing
+  // left rejected and RF-sleep replies on the OP1w 4K v2 falling through to
+  // the byte-shifting path below, corrupting the payload length calculation.
   const hasWireHeader = raw.length === payloadLength
     && raw.length >= 2
     && (raw[0] === 0 || raw[0] === EGG_REPORT.config || raw[0] === EGG_REPORT.command)
-    && (raw[1] === 0x01 || raw[1] === 0x03);
+    && (raw[1] === 0x01 || raw[1] === 0x03 || raw[1] === 0x07 || raw[1] === 0x08);
   if (hasWireHeader) {
     const result = new Uint8Array(Math.max(expectedTotal, raw.length));
     result.set(raw);
@@ -181,6 +321,40 @@ export function eggProfileForPid(pid: number): EggDeviceProfile {
   const profile = EGG_DEVICE_PROFILES.get(pid);
   if (!profile) throw new Error(`Unsupported Endgame Gear product 0x${pid.toString(16)}.`);
   return profile;
+}
+
+/**
+ * Every setting the EggOp1HidClient exposes for one device. Mirrors the
+ * driver's setter surface: v2-only sensor controls, glass mode, and the
+ * motion-jitter filter (absent on 4K v2) are the only per-device branches.
+ * Notably absent: LED zone control, on-board profile management, wireless
+ * pairing/battery — the vendor tools have them, this driver does not.
+ */
+export function eggExposedFeatures(profile: EggDeviceProfile): EggExposedFeature[] {
+  const features: EggExposedFeature[] = [
+    "dpi-stages",
+    "polling-rate",
+    "lift-off-distance",
+    "motion-sync",
+    "angle-snapping",
+    "ripple-control",
+    "slamclick-filter",
+    "spdt-mode",
+    "cpi-levels",
+    "multiclick-filter",
+    "button-mapping",
+    "left-handed-mode",
+    "factory-reset",
+    "firmware-version",
+  ];
+  if (profile.lodGlass !== null) features.push("glass-mode");
+  if (profile.configFamily === "v2") {
+    features.push("sensor-angle-tuning", "force-max-fps", "led-lift-off");
+  }
+  if (!(profile.wireless4k === true && profile.configFamily === "v2")) {
+    features.push("motion-jitter-filter");
+  }
+  return features;
 }
 
 export function eggCpiStep(profile: EggDeviceProfile, cpi: number): number {

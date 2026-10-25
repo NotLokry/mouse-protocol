@@ -1,5 +1,11 @@
 export const TEEVOLUTION_REPORT_ID = 0x08;
 export const TEEVOLUTION_PACKET_LENGTH = 16;
+/** RapidSync 8K LCD clock — separate HID collection from Compx report 8. */
+export const TEEVOLUTION_LCD_REPORT_ID = 0x0a;
+export const TEEVOLUTION_LCD_PACKET_LENGTH = 40;
+export const TEEVOLUTION_LCD_USAGE_PAGE = 0xff08;
+export const TEEVOLUTION_LCD_USAGE = 0x02;
+export const TEEVOLUTION_LCD_SET_TIME = 0x0010;
 export const TEEVOLUTION_MAX_CHUNK = 10;
 export const TEEVOLUTION_DPI_MAX = 42000;
 export const TEEVOLUTION_PRODUCT_IDS = new Set([0xf520, 0xf523, 0xf5bb, 0xf522]);
@@ -79,6 +85,7 @@ export const TEEVOLUTION_COMMAND = {
   writeFlashData: 0x07,
   readFlashData: 0x08,
   getCurrentConfig: 0x0e,
+  setCurrentConfig: 0x0f,
   readVersionId: 0x12,
   getDongleVersion: 0x1d,
   getRssi: 0x2b,
@@ -87,13 +94,19 @@ export const TEEVOLUTION_COMMAND = {
 /** Flash offsets used by Teevolink / Compx HUB for Terra Pro. */
 export const TEEVOLUTION_FLASH = {
   reportRate: 0,
+  /** Number of enabled DPI stages (1…dpiStageCount). */
+  maxDpiStage: 2,
+  /** Active DPI stage index (0-based). */
   currentDpi: 4,
   liftOffDistance: 10,
+  /** Base of 4-byte DPI stage records. */
   dpiValues: 12,
   dpiLightMode: 76,
   dpiLightBrightness: 78,
   dpiLightSpeed: 80,
   dpiLightState: 82,
+  /** Base of 4-byte key-function records (one per physical button). */
+  keyFunction: 96,
   debounceTime: 169,
   motionSync: 171,
   sleepTime: 173,
@@ -103,6 +116,186 @@ export const TEEVOLUTION_FLASH = {
   performanceTime: 183,
   sensorMode: 185,
 } as const;
+
+/** Teevolink MouseKeyFunction class byte stored at flash 0x60 + 4×index. */
+export const TEEVOLUTION_KEY_CLASS = {
+  disable: 0,
+  mouse: 1,
+  dpi: 2,
+  tilt: 3,
+} as const;
+
+export const TEEVOLUTION_BUTTONS = [
+  { name: "Left", index: 0 },
+  { name: "Right", index: 1 },
+  { name: "Middle", index: 2 },
+  { name: "Back", index: 3 },
+  { name: "Forward", index: 4 },
+  { name: "DPI", index: 5 },
+] as const;
+
+export type TeevolutionButtonName = (typeof TEEVOLUTION_BUTTONS)[number]["name"];
+
+export interface TeevolutionButtonAction {
+  label: string;
+  cls: number;
+  param: number;
+}
+
+/** Simple assignments the generic remap dropdown can write. */
+export const TEEVOLUTION_BUTTON_ACTIONS: readonly TeevolutionButtonAction[] = [
+  { label: "Left Click", cls: TEEVOLUTION_KEY_CLASS.mouse, param: 0x0100 },
+  { label: "Right Click", cls: TEEVOLUTION_KEY_CLASS.mouse, param: 0x0200 },
+  { label: "Middle Click", cls: TEEVOLUTION_KEY_CLASS.mouse, param: 0x0400 },
+  { label: "Backward", cls: TEEVOLUTION_KEY_CLASS.mouse, param: 0x0800 },
+  { label: "Forward", cls: TEEVOLUTION_KEY_CLASS.mouse, param: 0x1000 },
+  { label: "DPI Loop", cls: TEEVOLUTION_KEY_CLASS.dpi, param: 0x0100 },
+  { label: "DPI+", cls: TEEVOLUTION_KEY_CLASS.dpi, param: 0x0200 },
+  { label: "DPI-", cls: TEEVOLUTION_KEY_CLASS.dpi, param: 0x0300 },
+  { label: "Scroll Left", cls: TEEVOLUTION_KEY_CLASS.tilt, param: 0x0100 },
+  { label: "Scroll Right", cls: TEEVOLUTION_KEY_CLASS.tilt, param: 0x0200 },
+  { label: "Disable", cls: TEEVOLUTION_KEY_CLASS.disable, param: 0x0000 },
+];
+
+export const TEEVOLUTION_BUTTON_OPTIONS = TEEVOLUTION_BUTTON_ACTIONS.map((action) => action.label);
+
+/**
+ * What the reference firmware's own configurators offer (G-Wolves' web
+ * driver, Dareu's panel). Tilt is Teevolution's addition, so the other brands
+ * on this key table leave it out.
+ */
+export const TEEVOLUTION_SHARED_BUTTON_OPTIONS = TEEVOLUTION_BUTTON_ACTIONS
+  .filter((action) => action.cls !== TEEVOLUTION_KEY_CLASS.tilt)
+  .map((action) => action.label);
+
+export const TEEVOLUTION_KEY_RECORD_LENGTH = 4;
+export const TEEVOLUTION_KEY_TABLE_LENGTH = TEEVOLUTION_BUTTONS.length * TEEVOLUTION_KEY_RECORD_LENGTH;
+/** TeevoLink ProfileOptions: four firmware-managed flash banks. */
+export const TEEVOLUTION_PROFILE_COUNT = 4;
+
+export function teevolutionKeyFunctionAddress(index: number): number {
+  if (!Number.isInteger(index) || index < 0 || index >= TEEVOLUTION_BUTTONS.length) {
+    throw new Error("Teevolution button index is out of range.");
+  }
+  return TEEVOLUTION_FLASH.keyFunction + index * TEEVOLUTION_KEY_RECORD_LENGTH;
+}
+
+export function teevolutionEncodeKeyFunction(cls: number, param: number): Uint8Array {
+  if (!Number.isInteger(cls) || cls < 0 || cls > 0xff) {
+    throw new Error("Teevolution key class must be one byte.");
+  }
+  if (!Number.isInteger(param) || param < 0 || param > 0xffff) {
+    throw new Error("Teevolution key parameter must be a 16-bit value.");
+  }
+  const bytes = [cls, (param >> 8) & 0xff, param & 0xff];
+  return new Uint8Array([...bytes, teevolutionDataChecksum(bytes)]);
+}
+
+export function teevolutionDecodeKeyFunction(data: Uint8Array | readonly number[]): {
+  cls: number;
+  param: number;
+  checksumValid: boolean;
+} {
+  const cls = data[0] ?? 0;
+  const param = ((data[1] ?? 0) << 8) | (data[2] ?? 0);
+  const checksumValid = data.length >= 4
+    && (data[3] ?? 0) === teevolutionDataChecksum([cls, (param >> 8) & 0xff, param & 0xff]);
+  return { cls, param, checksumValid };
+}
+
+export function teevolutionFindButtonAction(label: string): TeevolutionButtonAction | null {
+  return TEEVOLUTION_BUTTON_ACTIONS.find((action) => action.label === label) ?? null;
+}
+
+export function teevolutionFindButton(name: string): (typeof TEEVOLUTION_BUTTONS)[number] | null {
+  return TEEVOLUTION_BUTTONS.find((button) => button.name === name) ?? null;
+}
+
+export function teevolutionKeyFunctionLabel(data: Uint8Array | readonly number[]): string {
+  const { cls, param } = teevolutionDecodeKeyFunction(data);
+  return TEEVOLUTION_BUTTON_ACTIONS.find((action) => action.cls === cls && action.param === param)?.label
+    ?? "Custom";
+}
+
+export function teevolutionIsLeftClick(cls: number, param: number): boolean {
+  return cls === TEEVOLUTION_KEY_CLASS.mouse && param === 0x0100;
+}
+
+export function teevolutionKeyTableHasLeftClick(table: Uint8Array | readonly number[]): boolean {
+  for (let index = 0; index < TEEVOLUTION_BUTTONS.length; index += 1) {
+    const offset = index * TEEVOLUTION_KEY_RECORD_LENGTH;
+    const { cls, param } = teevolutionDecodeKeyFunction(table.slice(offset, offset + TEEVOLUTION_KEY_RECORD_LENGTH));
+    if (teevolutionIsLeftClick(cls, param)) return true;
+  }
+  return false;
+}
+
+/**
+ * `base` is where the key table starts inside `flash`: the default suits a
+ * whole flash image read from address 0, and 0 suits a buffer holding just
+ * the table. `buttons` trims the list for a mouse without a DPI slot.
+ */
+export function teevolutionDecodeButtonMappings(
+  flash: Uint8Array | readonly number[],
+  base: number = TEEVOLUTION_FLASH.keyFunction,
+  buttons: number = TEEVOLUTION_BUTTONS.length,
+): Record<string, string> {
+  const mappings: Record<string, string> = {};
+  for (const { name, index } of TEEVOLUTION_BUTTONS.slice(0, buttons)) {
+    const offset = base + index * TEEVOLUTION_KEY_RECORD_LENGTH;
+    mappings[name] = flash.length >= offset + TEEVOLUTION_KEY_RECORD_LENGTH
+      ? teevolutionKeyFunctionLabel(flash.slice(offset, offset + TEEVOLUTION_KEY_RECORD_LENGTH))
+      : "Custom";
+  }
+  return mappings;
+}
+
+/** Reads a flash range; each driver passes its own transport. */
+export type TeevolutionFlashRead = (address: number, length: number) => Promise<Uint8Array>;
+
+/**
+ * The six key records on their own. Two records per read keeps every request
+ * under the 10-byte payload cap these transports share.
+ */
+export async function teevolutionReadKeyTable(read: TeevolutionFlashRead): Promise<Uint8Array> {
+  const table = new Uint8Array(TEEVOLUTION_KEY_TABLE_LENGTH);
+  for (let offset = 0; offset < table.length; offset += 2 * TEEVOLUTION_KEY_RECORD_LENGTH) {
+    table.set(await read(TEEVOLUTION_FLASH.keyFunction + offset, 2 * TEEVOLUTION_KEY_RECORD_LENGTH), offset);
+  }
+  return table;
+}
+
+/**
+ * One remap, for any firmware that keeps this key table at this address
+ * (Teevolution, Pulsar, Lamzu Atlantis, VGN F2, G-Wolves). Writes only the
+ * record that changes and reads it back. Returns the confirmed action, or
+ * null when the button already had it and nothing was written. `buttons`
+ * and `actions` hold a driver to what its mouse actually offers.
+ */
+export async function teevolutionRemapButton(
+  read: TeevolutionFlashRead,
+  write: (address: number, data: Uint8Array) => Promise<void>,
+  button: string,
+  action: string,
+  { buttons = TEEVOLUTION_BUTTONS.length, actions = TEEVOLUTION_BUTTON_OPTIONS }:
+    { buttons?: number; actions?: readonly string[] } = {},
+): Promise<string | null> {
+  const slot = teevolutionFindButton(button);
+  if (!slot || slot.index >= buttons) throw new Error(`This mouse has no "${button}" button.`);
+  const table = await teevolutionReadKeyTable(read);
+  const offset = slot.index * TEEVOLUTION_KEY_RECORD_LENGTH;
+  if (teevolutionKeyFunctionLabel(table.slice(offset, offset + TEEVOLUTION_KEY_RECORD_LENGTH)) === action) return null;
+  const assigned = actions.includes(action) ? teevolutionFindButtonAction(action) : null;
+  if (!assigned) throw new Error(`Unknown button action "${action}".`);
+  const payload = teevolutionEncodeKeyFunction(assigned.cls, assigned.param);
+  table.set(payload, offset);
+  if (!teevolutionKeyTableHasLeftClick(table)) throw new Error("Keep at least one button as Left Click.");
+  const address = teevolutionKeyFunctionAddress(slot.index);
+  await write(address, payload);
+  const confirmed = teevolutionKeyFunctionLabel(await read(address, payload.length));
+  if (confirmed !== assigned.label) throw new Error(`The mouse kept ${confirmed} on ${button} instead of ${assigned.label}.`);
+  return confirmed;
+}
 
 export const TEEVOLUTION_TYPE_MAX_POLL: Record<number, number> = {
   0: 1000,
@@ -192,6 +385,28 @@ export function teevolutionBuildOnlinePayload(enabled: boolean): Uint8Array {
   const payload = teevolutionBuildSimplePayload(TEEVOLUTION_COMMAND.deviceOnline);
   payload[5] = enabled ? 1 : 0;
   return finalize(payload);
+}
+
+/** Build SetCurrentConfig with TeevoLink's length byte and zero-based bank. */
+export function teevolutionBuildSetCurrentProfile(profile: number): Uint8Array {
+  if (!Number.isInteger(profile) || profile < 0 || profile >= TEEVOLUTION_PROFILE_COUNT) {
+    throw new Error(`Teevolution profile must be between 0 and ${TEEVOLUTION_PROFILE_COUNT - 1}.`);
+  }
+  const payload = teevolutionBuildSimplePayload(TEEVOLUTION_COMMAND.setCurrentConfig);
+  payload[4] = 1;
+  payload[5] = profile;
+  return finalize(payload);
+}
+
+/**
+ * Decode GetCurrentConfig. TeevoLink treats status 1 as “no profile switch”
+ * (`supportChangeProfile = false`); only a 0–3 bank in byte 5 is usable.
+ */
+export function teevolutionDecodeCurrentProfile(response: Uint8Array | readonly number[]): number | null {
+  if (!teevolutionPacketChecksumIsValid(response)) return null;
+  if (response[0] !== TEEVOLUTION_COMMAND.getCurrentConfig || response[1] !== 0) return null;
+  const profile = response[5] ?? 0;
+  return profile < TEEVOLUTION_PROFILE_COUNT ? profile : null;
 }
 
 export function teevolutionParseReadResponse(
@@ -349,5 +564,38 @@ export function teevolutionSensorModeUi(options: {
   }
   // 2000/4000 Hz wireless on PAW3950 uses corded/Ultra tracking.
   return { mode: "Ultra", editable: false, storedValue };
+}
+
+/**
+ * Teevolink Generate_CRC for RapidSync LCD writes: last byte is
+ * `(0x55 - sum(packet[0..len-2])) & 0xff`, including the report-id byte.
+ */
+export function teevolutionLcdChecksum(packet: Uint8Array | readonly number[]): number {
+  if (packet.length < 2) throw new Error("Teevolution LCD packets need a checksum byte.");
+  let sum = 0;
+  for (let index = 0; index < packet.length - 1; index += 1) sum += packet[index]! & 0xff;
+  return (0x55 - (sum & 0xff)) & 0xff;
+}
+
+/**
+ * 40-byte RapidSync set-time write, including report id 0x0A as byte 0.
+ * DateTime layout matches Teevolink GetCurrentTimer_Tick (year big-endian,
+ * Sunday = 0). WebHID sendReport uses bytes 1…39.
+ */
+export function teevolutionBuildLcdTimePacket(now: Date): Uint8Array {
+  const packet = new Uint8Array(TEEVOLUTION_LCD_PACKET_LENGTH);
+  packet[0] = TEEVOLUTION_LCD_REPORT_ID;
+  packet[1] = TEEVOLUTION_LCD_SET_TIME >> 8;
+  packet[2] = TEEVOLUTION_LCD_SET_TIME & 0xff;
+  packet[3] = (now.getFullYear() >> 8) & 0xff;
+  packet[4] = now.getFullYear() & 0xff;
+  packet[5] = now.getMonth() + 1;
+  packet[6] = now.getDate();
+  packet[7] = now.getHours();
+  packet[8] = now.getMinutes();
+  packet[9] = now.getSeconds();
+  packet[10] = now.getDay();
+  packet[TEEVOLUTION_LCD_PACKET_LENGTH - 1] = teevolutionLcdChecksum(packet);
+  return packet;
 }
 

@@ -1,0 +1,110 @@
+{
+  "orig": {
+    "dpi": 1600,
+    "dpiY": 1600,
+    "pollingRateHz": 1000,
+    "sleepTimeout": 300,
+    "lowBatteryWarning": 30,
+    "battery": "25% Discharging"
+  },
+  "final": {
+    "dpi": 1600,
+    "dpiY": 1600,
+    "pollingRateHz": 1000,
+    "sleepTimeout": 300,
+    "lowBatteryWarning": 30,
+    "battery": "25% Discharging"
+  },
+  "results": [
+    {
+      "name": "DPI 800",
+      "expect": 800,
+      "setterReturned": 800,
+      "readAfterReload": 800,
+      "ok": true
+    },
+    {
+      "name": "DPI 3200",
+      "expect": 3200,
+      "setterReturned": 3200,
+      "readAfterReload": 3200,
+      "ok": true
+    },
+    {
+      "name": "DPI restore 1600",
+      "expect": 1600,
+      "setterReturned": 1600,
+      "readAfterReload": 1600,
+      "ok": true
+    },
+    {
+      "name": "polling 125 Hz",
+      "expect": 125,
+      "setterReturned": 125,
+      "readAfterReload": 125,
+      "ok": true
+    },
+    {
+      "name": "polling 500 Hz",
+      "expect": 500,
+      "setterReturned": 500,
+      "readAfterReload": 500,
+      "ok": true
+    },
+    {
+      "name": "polling restore 1000 Hz",
+      "expect": 1000,
+      "setterReturned": 1000,
+      "readAfterReload": 1000,
+      "ok": true
+    },
+    {
+      "name": "polling 2000 Hz refused",
+      "ok": true,
+      "error": "This mouse does not support 2,000 Hz on this connection."
+    },
+    {
+      "name": "sleep 60 s",
+      "expect": 60,
+      "setterReturned": 60,
+      "readAfterReload": 60,
+      "ok": true
+    },
+    {
+      "name": "sleep 900 s",
+      "expect": 900,
+      "setterReturned": 900,
+      "readAfterReload": 900,
+      "ok": true
+    },
+    {
+      "name": "sleep restore 300 s",
+      "expect": 300,
+      "setterReturned": 300,
+      "readAfterReload": 300,
+      "ok": true
+    },
+    {
+      "name": "low power 5%",
+      "expect": 5,
+      "setterReturned": 5,
+      "readAfterReload": 5,
+      "ok": true
+    },
+    {
+      "name": "low power 50%",
+      "expect": 50,
+      "setterReturned": 50,
+      "readAfterReload": 50,
+      "ok": true
+    },
+    {
+      "name": "low power restore 30%",
+      "expect": 30,
+      "setterReturned": 30,
+      "readAfterReload": 30,
+      "ok": true
+    }
+  ],
+  "exchanges": 486
+}

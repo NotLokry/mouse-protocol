@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { EggOp1HidClient } from "./egg-op1-hid.ts";
+import { EggWeHidClient } from "./egg-we-hid.ts";
+
 import {
   WE_OFF,
   WE_REPORT_ID,
   weBuildReadEepromPayload,
   weBuildWriteEepromPayload,
+  weExposedFeatures,
   wePackDpiStage,
   wePackScalarPair,
   weParseReadEepromResponse,
@@ -15,6 +19,96 @@ import {
   weUnpackDpiStage,
   weUnpackScalarPair,
 } from "@openmouse/protocol/endgame-gear-we";
+
+function hidDevice(productId: number, productName = "", featureReportIds: number[] = []): HIDDevice {
+  return {
+    vendorId: 0x3367,
+    productId,
+    productName,
+    collections: featureReportIds.length === 0 ? [] : [{
+      usagePage: 0xff02,
+      usage: 0,
+      featureReports: featureReportIds.map((reportId) => ({ reportId, items: [] })),
+      inputReports: [],
+      outputReports: [],
+      children: [],
+    }],
+  } as unknown as HIDDevice;
+}
+
+test("XM2we receiver revisions are supported and keep their model identity", () => {
+  for (const productId of [0x1960, 0x1968, 0x1982]) {
+    const device = hidDevice(productId);
+    assert.equal(EggWeHidClient.isSupported(device), true);
+    assert.equal(EggWeHidClient.isReceiverDevice(device), true);
+    assert.equal(EggWeHidClient.displayNameForDevice(device), "Endgame Gear XM2we");
+    assert.equal(new EggWeHidClient(device).displayName(), "Endgame Gear XM2we");
+  }
+});
+
+test("a 0x1970 receiver exposing the OP1-8K command report is left for EggOp1HidClient (issue #107)", () => {
+  const legacyWeDongle = hidDevice(0x1970);
+  assert.equal(EggWeHidClient.isSupported(legacyWeDongle), true);
+
+  const op1w4kV2Dongle = hidDevice(0x1970, "", [0xa1]);
+  assert.equal(EggWeHidClient.isSupported(op1w4kV2Dongle), false);
+});
+
+test("a cabled XM2w 4K v2 (0x1982, also an XM2we receiver PID) exposing 0xa1 is left for EggOp1HidClient", () => {
+  assert.equal(EggWeHidClient.isSupported(hidDevice(0x1982, "", [0xa1])), false);
+  assert.equal(EggOp1HidClient.isSupported(hidDevice(0x1982, "", [0xa1])), true);
+  assert.equal(EggWeHidClient.isSupported(hidDevice(0x1982)), true);
+});
+
+test("sibling interfaces of a 4K v2 dongle are not picked as WE (ticket #0126)", () => {
+  const vendorSibling = hidDevice(0x1970, "", [0x05]);
+  assert.deepEqual(EggWeHidClient.pickDevices([hidDevice(0x1970), vendorSibling, hidDevice(0x1970, "", [0xa1])]), []);
+  assert.equal(EggWeHidClient.fromAuthorizedDevices([vendorSibling, hidDevice(0x1970, "", [0xa1])]), null);
+  assert.deepEqual(EggWeHidClient.pickDevices([vendorSibling]), [vendorSibling]);
+});
+
+test("descriptor walks tolerate sparse WebHID collections (openmouse update-protocol)", () => {
+  const sparse = {
+    vendorId: 0x3710,
+    productId: 0x1234,
+    productName: "Example Mouse",
+    collections: [{
+      usagePage: 0xff00,
+      usage: 1,
+      inputReports: [{ reportId: 0x08 }],
+      outputReports: [{ reportId: 0x08 }],
+      featureReports: [],
+    }],
+    opened: false,
+  } as unknown as HIDDevice;
+  assert.equal(EggWeHidClient.isSupported(sparse), false);
+  assert.deepEqual(EggWeHidClient.pickDevices([sparse, sparse]), []);
+
+  const sparseEndgame = {
+    vendorId: 0x3367,
+    productId: 0x1962,
+    productName: "OP1we",
+    collections: [{
+      usagePage: 0xff02,
+      usage: 0,
+      featureReports: [{ reportId: 0x04 }],
+    }],
+    opened: false,
+  } as unknown as HIDDevice;
+  assert.equal(EggWeHidClient.isSupported(sparseEndgame), true);
+  assert.deepEqual(EggWeHidClient.pickDevices([sparse, sparseEndgame]), [sparseEndgame]);
+});
+
+test("WE model names can fall back to the USB product string", () => {
+  assert.equal(
+    EggWeHidClient.displayNameForDevice(hidDevice(0x1962, "XM2we")),
+    "Endgame Gear XM2we",
+  );
+  assert.equal(
+    EggWeHidClient.displayNameForDevice(hidDevice(0x1962, "OP1we")),
+    "Endgame Gear OP1we",
+  );
+});
 
 test("commands produce a valid report checksum", () => {
   for (const payload of [weBuildReadEepromPayload(0x1234, 8), weBuildWriteEepromPayload(0x12, [1, 2, 3, 4])]) {
@@ -56,4 +150,8 @@ test("DPI changes only the active stage and preserves flags", () => {
 test("DPI patch refuses corrupt source stages", () => {
   const profile = new Uint8Array(WE_OFF.dpiStages + 4);
   assert.throws(() => wePatchActiveDpi(profile, 800, 0), /checksum is invalid/);
+});
+
+test("WE mice expose battery, DPI, polling, and lift-off distance", () => {
+  assert.deepEqual(weExposedFeatures(), ["battery", "dpi", "polling-rate", "lift-off-distance"]);
 });

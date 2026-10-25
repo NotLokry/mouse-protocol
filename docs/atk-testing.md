@@ -1,0 +1,381 @@
+# ATK / VXE hardware testing
+
+Use the vendor configuration interface (`usagePage 0xff02`, `usage 0x02`). It
+uses report ID `0x08` with a 16-byte payload. Do not record device serial
+numbers in captures or test documentation.
+
+## Identification
+
+Shared USB product IDs do not reliably identify the mouse or sensor. The driver
+sends CID/MID command `0x10` and looks up the returned pair in
+`src/drivers/atk/products.ts`. A failed identification is retried up to three
+times because a sleeping wireless mouse may not answer. Closing the client
+resets that retry budget.
+
+A successful but unknown ATK identity retains the historical A9 codec and
+USB-name behavior. Generic ATK devices that do not answer CID/MID do the same.
+A shared VXE R1 transport that does not answer instead fails before using that
+fallback codec. Known VXE identities report the VXE brand.
+
+## Verified ATK X1 Pro Max
+
+ATK HUB 3.2.27 maps CID/MID `2,39` to the X1 Pro Max with PAW3950.
+Sources: [ATK HUB](https://hub.atk.pro/) and its
+[3.2.27 application bundle](https://bpcdn.atkgear.com/hub-v3/production/3.2.27/static/index-DBE__Npj.js).
+The owner confirmed 1,200 DPI and 8,000 Hz and supplied the HUB settings view.
+
+Hardware verification on 2026-09-21 used the actual `AtkHidClient` through a
+native HID adapter implementing its WebHID-shaped transport. Physical
+polling-frequency measurements were not tested.
+
+On 2026-09-22, the owner additionally tested the locally built OpenMouse web
+UI over the 8K receiver. They reported that all buttons were recognized,
+different DPI and polling-rate settings applied, and settings persisted after
+switching the mouse fully off and on. These are owner-reported observations;
+the exact additional DPI/rate values and button remapping were not verified.
+Browser UI operation over the cable has not yet been tested. Lighting and
+long-range controls are not implemented for this model.
+
+The owner also tested the stock `373b:101a` ATK Mouse 1K Dongle (USB
+`bcdDevice 0211`) and reported normal operation, but found the UI offered
+8,000 Hz despite the 1K transport limit. This receiver now offers only 125,
+250, 500 and 1,000 Hz, rejects higher-rate writes before sending a command,
+and caps the reported rate at 1,000 Hz if the mouse retains an 8K setting.
+The local browser displayed 1,200 DPI and 1,000 Hz after this correction.
+This is a configured rate capped by the receiver's limit, not a measured
+physical polling frequency. The raw read/write traces below cover only the
+cable and 8K receiver; the new 1K rate regression tests use synthetic replies.
+
+| Connection | VID:PID | Product | USB bcdDevice | Mouse firmware |
+| --- | --- | --- | --- | --- |
+| Cable | `373b:1017` | ATK X1 PRO MAX | `0218` | 2.18 |
+| 8K receiver | `373b:101b` | ATK Mouse 8K Dongle | `0216` | 2.18 |
+
+Both use interface 1, usage page `ff02`, usage `2`, and report `08` with a
+16-byte input/output payload. Both returned CID/MID `2,39`. The receiver PID
+is shared: model selection must continue to use CID/MID. Initial receiver
+probes timed out; after the owner woke the mouse and closed ATK HUB, reads
+succeeded. No transport or discovery-filter change was necessary.
+
+The captured stages `0f 0f 00 37` and `17 17 00 27` decode as 800 and 1,200
+DPI using PAW3950's 50-DPI encoding. Stage 2 was active. The generic Ultra
+fallback would decode them as 160 and 240 DPI. The model uses the existing
+36,000-DPI codec ceiling; that ceiling comes from the vendor catalog and was
+not exercised on hardware.
+
+The screenshot and register reads confirm these model-specific settings:
+
+- Lift-off uses discrete codes `3 = 0.7 mm`, `1 = 1 mm`, `2 = 2 mm`, exposed
+  as Low/Medium/High. It must not use the Ultra continuous lift-off scale.
+- Straight-line correction is the pair at offset 6 of the `00a9` advanced
+  row. The `00bd` angle row read `ff ff ff ff` and is unsupported.
+- Debounce choices are 0, 1, 2, 4, 8, 15, 20 ms.
+- Sleep choices are 30, 60, 120, 180, 300, 1200, 1500, 1800 seconds.
+
+On **each connection**, the following writes were confirmed by driver
+readback and immediately restored:
+
+| Setting | Baseline | Test | Restored |
+| --- | --- | --- | --- |
+| Active-stage DPI | 1,200 | 1,250 | 1,200 |
+| Polling setting | 8,000 Hz | 4,000 Hz | 8,000 Hz |
+| Lift-off | 2 mm | 1 mm, then 0.7 mm | 2 mm after each |
+| Debounce | 0 ms | 1 ms | 0 ms |
+| Sleep | 60 seconds | 120 seconds | 60 seconds |
+| Motion Sync | On | Off | On |
+| Ripple correction | On | Off | On |
+| Straight-line correction | On | Off | On |
+
+The complete final status matched the original configuration for all tested
+fields. Unplugging the receiver and connecting the cable also retained the
+restored configuration. The battery reply reported discharging on receiver
+and charging on cable. Its declared length was two bytes, so padding was not
+interpreted as voltage. Firmware readback was 2.18 on both paths.
+
+The catalog verification covers these settings and these exact connections.
+Other firmware/receivers, lighting, long-range mode, button remapping, profile
+selection, stage-count editing, and the full DPI/rate ranges are not claimed
+as tested. Sanitized driver traces and restoration results are in
+`captures/atk-x1-pro-max/`.
+
+## Verified ATK A9 Plus Nearlink
+
+ATK HUB 3.2.27 maps CID/MID `2,83` on `373b:1115` to "ATK A9 Plus NK" with
+PAW3395, `firmwareMark` `a9`, and `noFarDistance` (no long-range mode). The
+same entry appears in both the `hub.atk.pro` and `v3-hub.atk.store` builds,
+where HUB groups it with the VXE R1 and R1 Pro Max under one PAW3395 COMPX
+controller. OpenMouse names it "A9 Plus Nearlink", after the product string
+the mouse reported on firmware 1.20.
+
+| Connection | VID:PID | Product string | Firmware |
+| --- | --- | --- | --- |
+| Cable | `373b:1115` | ATK A9 Plus Nearlink | Mouse 1.20 |
+| Cable | `373b:1115` | ATK A9 PLUS 2.0 NK | Mouse 1.30 |
+| NearLink receiver | `373b:10c9` | Nearlink Mouse Dongle | Receiver 1.20 |
+| NearLink receiver | `373b:10c9` | NK mouse NANO dongle | Receiver 1.23 |
+
+The cable interface exposes two `ff02:0002` collections, one with report `08`
+(16 bytes) and one with report `13` (19 bytes), beside a consumer-control
+collection and an `ff04:0002` collection with feature report `06`. The driver
+uses report `08`. The owner's read traces are in `captures/atk-a9-plus-nk/`:
+`wired.json` and `receiver.json` on firmware 1.20, `wired-1.30.json` and
+`receiver-1.30.json` after the update, and `sensor-mode.json` with the `00b5`
+row in each sensor mode.
+
+The receiver exposes the same four collections and answers for the mouse
+behind it: CID/MID `2,83` and the same status read as the cable, except that
+the battery reply reports discharging. ATK HUB lists `373b:10c9` as a generic
+receiver, "NK Mouse Dongle", in the same COMPX group, so the model is selected
+by CID/MID on both paths. OpenMouse labels the link "NearLink receiver" by
+this PID, since the dongle's product string changed with its firmware. HUB's
+separate Bitmouse entries named "ATK A9 Plus NK" (`373b:1224`, `1263`, `1300`
+on usage page `ff05`) belong to other hardware revisions and were not seen on
+this unit.
+
+- Before this identity was added, the unknown-product fallback decoded the
+  active stage `1f 1f 00 17` as 320 DPI. The owner had set 1,600 DPI in ATK
+  HUB, which matches PAW3395's 50-DPI encoding.
+- ATK HUB's connect handshake (`DownLoadData`, command `0x01`, with four
+  random bytes) returned CID/MID `2,83` and connection type `2`, which HUB
+  names wired 1K. The owner confirms 1,000 Hz is the ceiling on both cable and
+  receiver, so OpenMouse offers 125 through 1,000 Hz and rejects higher rates
+  before writing. The driver does not send this handshake itself.
+- Lift-off read code `1`. The mouse uses the R1's codes, `1 = 1 mm` and
+  `2 = 2 mm`, not the continuous scale whose code `1` means 0.7 mm.
+- Straight-line correction is the pair at offset 6 of the `00a9` advanced row,
+  as on the X1 Pro Max. On firmware 1.20 the `00bd` row read `ff ff ff ff`;
+  firmware 1.30 changes it, as described below.
+- The battery reply declared two bytes: 100% and charging on the cable,
+  discharging through the receiver. Bytes after the declared payload are
+  padding and are not interpreted as voltage.
+- `GetMouseVersion` (`0x12`) returned 1.20 on both paths while the mouse and
+  receiver both ran 1.20. After the update it returned 1.30 on both paths with
+  the receiver at 1.23, so through the receiver the mouse answers.
+- HUB's Sensor Sampling Rate is the sensor-model pair at bytes 4-5 of the
+  `00b5` row, laid out as on the R1: sensor-sleep enabled, sensor-sleep time,
+  sensor model. HUB 1.30 offers "Basic Mode" (`0`) and "ATK Shard Competitive
+  Firmware" (`1`); the row read `01 54 0c 49 00 55` and `01 54 0c 49 01 54`
+  respectively, identically over cable and receiver. HUB adds a third mode,
+  Competitive Max (`2`), only for models whose upgrade entry sets
+  `cordedMode`; the `2,83` entry sets only `sensorAngle`, and the owner's HUB
+  showed only the two modes. OpenMouse exposes the pair as the R1's
+  Performance mode switch, writes the whole row with the sensor-sleep pairs
+  unchanged, and confirms the mode by reading it back.
+
+The owner read these choices from ATK HUB's settings for this mouse, and
+OpenMouse offers exactly the same lists:
+
+- Polling: 125, 250, 500, 1,000 Hz.
+- Lift-off: 1 mm and 2 mm, exposed as Low/High.
+- Debounce: 0, 1, 2, 4, 8, 15, 20 ms.
+- Sleep: 30, 60, 120, 180, 300, 1200, 1500, 1800 seconds.
+- Motion Sync, straight-line correction, and ripple correction: on/off.
+- Sensor Sampling Rate: Basic Mode and ATK Shard Competitive Firmware,
+  exposed as Performance mode off/on.
+
+On 2026-10-10 the owner tested the locally built OpenMouse web UI in a
+Chromium browser over the cable and then through the NearLink receiver, with
+mouse and receiver firmware 1.20. On each connection, each change below was
+applied without a readback error, survived a page reload, and was then
+restored. The last column lists the connections on which the owner also
+confirmed the written value in ATK HUB. These are owner-reported observations.
+
+| Setting | Baseline | Test | Restored | Confirmed in ATK HUB |
+| --- | --- | --- | --- | --- |
+| Active-stage DPI | 1,600 | 800 | 1,600 | Receiver |
+| Polling setting | 1,000 Hz | 500 Hz | 1,000 Hz | Both |
+| Lift-off | 1 mm | 2 mm | 1 mm | Both, both values |
+| Debounce | 2 ms | 4 ms | 2 ms | Receiver |
+| Sleep | 120 seconds | 300 seconds | 120 seconds | Receiver |
+| Motion Sync | Off | On | Off | Both |
+| Ripple correction | Off | On | Off | Both |
+| Straight-line correction | Off | On | Off | Both |
+
+The owner then updated the mouse to firmware 1.30 and the receiver to 1.23
+through ATK HUB, repeated the changes in the table on both connections, and
+reported that each still applied. The product strings changed as shown above,
+while the VID/PID pairs, collections, and CID/MID `2,83` stayed the same. The
+`00bd` row became `00 55 00 55`, which HUB 1.30 shows as Sensor Rotation: a
+dial from -30 to 30 degrees with an on/off switch. Per HUB's code the row is
+`[angle, 0x55 - angle, switch, 0x55 - switch]`, with negative angles stored
+as two's complement, and changing the angle keeps the switch. OpenMouse reads
+the stored angle into `angleTuning` but does not write this row yet.
+
+On firmware 1.30 with receiver 1.23, the owner also switched Performance mode
+on and off in OpenMouse, over the cable and then through the receiver. Each
+change applied without a readback error, survived a page reload, and showed
+in ATK HUB as the matching Sensor Sampling Rate.
+
+The catalog verification covers these settings on both connections, with the
+mouse on firmware 1.20 and 1.30 and the receiver on 1.20 and 1.23; the sensor
+mode was verified on 1.30 and 1.23 only. Sensor Rotation, button remapping,
+profile selection, stage-count editing, and the full DPI range are not
+claimed as tested.
+
+## Verified VXE R1 SE+
+
+The raw EEPROM and identity values below were captured directly from one VXE R1
+SE+ over its wired connection. The receiver telemetry described below was
+tested separately. The full sensor table and ranges, and the CID/MID mapping,
+were independently transcribed from the public ATK HUB 3.2.21 bundle; the
+low-range records below cross-check that transcription.
+
+- USB: VID/PID `0x3554:0xf58f`, product `VXE R1SE+`, firmware/bcdDevice 3.15.
+- Configuration channel: interface 1, usage page `0xff02`, usage `2`.
+- CID/MID: `2,32`, identified by ATK HUB as VXE R1SE+ with PAW3395SE.
+- Battery response: declared payload `5f 01` reports 95% and charging. Bytes
+  after the declared payload are padding and are not interpreted as voltage.
+- Vendor range: 200 through 18,000 DPI.
+- EEPROM DPI stage `12 12 00 31` decoded as 800 DPI.
+- EEPROM DPI stage `25 25 00 0b` decoded as 1,600 DPI.
+- EEPROM DPI stage `4b 4b 00 bf` decoded as 3,200 DPI.
+- Writes at 200, 10,000, 10,100, and 18,000 DPI were each confirmed through
+  device readback, including the high-DPI mode transition, then restored to
+  800 DPI.
+- OpenMouse was also exercised in Chromium through WebHID: it identified the
+  wired mouse, displayed 800 DPI and 1,000 Hz, applied 850 DPI through the
+  staged-save UI, and restored 800 DPI.
+- Motion Sync, ripple control, sleep timeout, 125 Hz polling, 2 mm lift-off,
+  1 ms debounce, and straight-line correction changes were confirmed through
+  wired EEPROM readback and restored.
+- ATK HUB 3.2.21 exposes wired polling at 125, 250, 500, and 1,000 Hz; debounce
+  at 0, 1, 2, 4, 8, 15, and 20 ms; 1 mm and 2 mm lift-off; and straight-line
+  correction in the advanced EEPROM block. OpenMouse follows those exact wired
+  EEPROM paths.
+- The same HUB build exposes up to eight DPI stages for this identity. The
+  active two stages were read as 800 and 1,600 DPI. Active-stage selection and
+  arbitrary-stage values were changed, confirmed, and restored. The configured
+  count remained at two because adding stages changes the user's profile shape.
+- A DPI-stage color, Basic/Competitive performance mode, Ultra Long Range, and
+  DPI lighting effect/brightness/speed were each changed, confirmed through
+  device readback, and restored. The final complete run reported every setting
+  at its captured baseline.
+
+PAW3395SE maps targets 50 through 10,000 in 50-DPI increments to codes 1
+through 235 while skipping these codes:
+
+```text
+7, 13, 20, 26, 33, 40, 46, 53, 60, 66, 73, 80, 86, 93, 100, 106, 113,
+120, 126, 133, 140, 146, 153, 160, 166, 173, 180, 186, 193, 200, 206,
+213, 220, 226, 233
+```
+
+The exposed writable options are 200 through 10,000 in 50-DPI increments,
+then 10,100 through 18,000 in 100-DPI increments. Values above 10,000 encode
+half the requested DPI and set bit 1 in that axis's mode nibble. This is mode
+bit 1 for X and mode bit 5 for Y. Codes in the skipped set and invalid mode
+combinations must be rejected rather than decoded approximately.
+
+## R1 live settings
+
+R1 family detection uses the identified product family, with the known receiver
+PID and R1 USB product name retained as fallbacks. The stock receiver retains
+the current live-settings behavior transcribed from OpenVXE:
+
+- Polling: 250, 500, and 1,000 Hz through selector `0x0b`.
+- Angle snapping: selector `0x01`.
+- Debounce: selector `0x02`, 1 through 20 ms.
+- Lift-off distance: selector `0x03`, Low or High.
+
+The wired CID/MID `2,32` path instead follows ATK HUB's EEPROM configuration:
+polling at `0x0000`, stage count and active stage in the same system block,
+up to eight DPI records from `0x000c`, lift-off at `0x000a`, and debounce,
+Motion Sync, sleep, straight-line correction, and ripple control at `0x00a9`.
+DPI-stage colors start at `0x002c`, DPI lighting is at `0x004c`, and the
+six-byte record at `0x00b5` stores sensor-sleep enabled, sensor-sleep time, and
+the sensor model exposed by the HUB as Basic/Competitive mode. Each field has a
+paired checksum byte, and the complete record must be written atomically. Ultra
+Long Range uses write command `0x16` and read command `0x17` rather than EEPROM.
+
+The middle pair at `0x00b5` read `0c 49` while the one-minute user sleep timer
+at `0x00a9` read `06 4f`. Attempts to treat the `0x00b5` pair as a second copy
+of the configurable timer did not retain non-default values, so OpenMouse does
+not write it when changing sleep timeout.
+
+Angle values from EEPROM are accepted only when each value/checksum pair sums
+to `0x55`. An unprogrammed `ff ff ff ff` row reports both angle fields as
+unsupported.
+
+Battery command `0x04` is decoded according to its declared payload length:
+percent requires one byte, the charging flag requires two, and big-endian cell
+voltage requires four. A missing or short reply leaves unavailable fields
+unknown rather than interpreting padding as data.
+
+## Profile selection and read-only button inspection
+
+ATK HUB exposes four firmware-managed configuration banks through
+`GetCurrentConfig` (`0x0e`) and `SetCurrentConfig` (`0x0f`). OpenMouse currently
+reads the active bank and can switch banks over the verified wired transport.
+The selector request declares one data byte at frame offset 4 and stores the
+zero-based bank at offset 5. Hardware testing cycled all four banks, captured
+5,376 bytes from each, restored bank 0, and reproduced its original SHA-256
+exactly. The captures differed across settings, buttons, and shortcut storage,
+confirming that EEPROM reads are redirected through the active bank.
+
+A recovery test isolated a two-event macro in bank 3, slot 0, without assigning
+it to a button. After a factory-reset experiment, banks 0 through 2 reproduced
+their original complete-image SHA-256 hashes. Bank 3 reproduced its original
+image outside slot 0; replaying ATK HUB's four-chunk macro reset sequence set the
+slot count to zero. Previously programmed event bytes cannot be changed back to
+their erased `0xff` representation through the observed EEPROM command, but a
+zero count makes them unreachable and matches the vendor's empty-macro
+semantics. The active bank was restored to bank 0. This also confirmed that
+checksum-protected settings and macro headers must retain the vendor's record
+and transaction boundaries during writes.
+
+The wired R1 button matrix contains six four-byte records at `0x0060`,
+`0x0064`, `0x0068`, `0x006c`, `0x0070`, and `0x0074`. Each record is
+`[class, value1, value2, checksum]` and all four bytes must sum to `0x55`
+modulo 256. OpenMouse reads them in the same three eight-byte groups as ATK
+HUB, preserves unknown values, and reports checksum failures. It does not write
+button records. Shortcut slots begin at `0x0100` in 32-byte increments. The
+vendor address table defines 12 macro slots beginning at `0x0300` in 384-byte
+increments and ending at `0x1500`. Neither region is read during ordinary
+status polling.
+
+Receiver command `0x03` reports online state and the three-byte RF identifier.
+Command `0x06` reports pairing status and seconds remaining. Both are safe
+telemetry reads. On the verified `0x3554:0xf58e` receiver, OpenMouse can start
+pairing command `0x05` for the R1 SE+ identity `[CID 0x02, MID 0x20]` after an
+explicit preparation step. Cancellation command `0x13` remains unavailable.
+
+The Nordic receiver was identified over USB as `0x3554:0xf58e`, product `VXE
+Mouse 1K Dongle`, firmware/bcdDevice 1.10. Its configuration channel is
+interface 1 with usage page `0xff02`, usage `2`, and report `0x08`. Read-only
+hardware probes produced checksum-valid replies for online status (`0x03`) and
+pairing status (`0x06`). Dongle-version command `0x1d` returned status `1`,
+declared zero payload bytes (`08 1d 01 00 00 00 00 00 00 00 00 00 00 00 00 00
+2f`, including report ID), and therefore cannot be used to expose the USB
+descriptor's 1.10 revision as protocol telemetry. Command `0x12` continued to
+report mouse firmware 3.15. The online reply declared one payload byte for
+status while retaining the three-byte RF identifier in its fixed frame
+positions, so the driver requires the declared status byte and decodes the
+identifier from the complete validated frame.
+
+Pairing was validated with the mouse cable unplugged and the mouse switched to
+2.4 GHz mode. After command `0x05`, holding left click, wheel click, and right
+click until the indicator flashed completed the exchange. Command `0x06`
+reached status 2 with zero seconds remaining, command `0x03` reported the mouse
+online, and the RF identifier remained stable across repeated reads. A prior
+attempt without the physical button gesture also reached status 2 but remained
+offline, so status 2 alone is not success. OpenMouse requires both terminal
+status 2 and online telemetry. Profiles 0 through 2 retained their exact
+pre-pairing hashes, profile 3 retained its zero-count cleared macro state, and
+the active bank was restored to bank 0 after verification.
+
+## Firmware package inspection
+
+The official R1 SE+ 3.15 COMPX package is 261,382 bytes. Its 720-byte logical
+header sits in an 8,192-byte header area followed by a 253,190-byte payload.
+The header identifies normal endpoint `0x3554:0xf58f`, boot endpoint
+`0x3554:0xf406`, IC `CX52850P`, sensor `3395se`, and version `0x315`.
+
+The prepare-command descriptor stores the raw CRC-32 register state (initial
+value `0xffffffff`, polynomial `0xedb88320`, no final XOR) in big-endian order.
+For version 3.15 it is `0x4026708e`; for version 3.14 it is `0xab88f525`.
+OpenMouse's package parser checks this payload CRC and package bounds. The
+vendor upgrader reads the header's `headCRC` field but does not appear to
+validate it, so OpenMouse does not claim that field as an integrity check.
+
+Firmware parsing is read-only. Entering boot mode, erase preparation, chunk
+transfers, factory reset, and macro clearing remain intentionally unavailable.

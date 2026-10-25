@@ -10,7 +10,7 @@
  *
  * The product list and the transport grouping come from OpenRazer's public
  * supported-device table and mouse driver (see
- * `OPENRAZER_ALL_MICE_DEVELOPER_REFERENCE.md`). Only the seven entries marked
+ * `OPENRAZER_ALL_MICE_DEVELOPER_REFERENCE.md`). Only the entries marked
  * `verified: true` have been exercised against real hardware by this project —
  * everything else is transcribed protocol facts, not a tested driver.
  *
@@ -40,9 +40,6 @@
  *   this driver could only ever time out on them.
  * - Orochi V2 Bluetooth (`0x0095`). A Bluetooth HID path is not the USB
  *   control channel and must not be assumed to take the same reports.
- * - HyperPolling Wireless Dongle (`0x00b3`). It is a receiver, not a mouse;
- *   addressing the mouse paired to it needs dongle-specific commands that are
- *   not documented here.
  * - Viper Mini (`0x008a`), Viper V4 Pro (`0x00e5`/`0x00e6`) and Cobra
  *   (`0x00a3`), which have their own drivers in this folder. Listing them here
  *   would give two drivers the same device.
@@ -75,6 +72,45 @@ export interface RazerProduct {
   transactionId: number;
   /** Battery commands only exist on models that have a cell. */
   hasBattery: boolean;
+  /**
+   * Class `0x02` button mapping (`RAZER_READ`/`RAZER_WRITE.buttonMapping`) has
+   * only ever been exercised on the Viper V3 Pro. Other Razer mice may well use
+   * a different class or a different control-index scheme, so nothing is
+   * offered to them until it has been checked on hardware. Gates both
+   * `RazerButtonControl` and `RazerToggleControl` — same command, same risk,
+   * no reason to split them.
+   *
+   * Set per product id, which means per *connection*: the cable and the
+   * receiver are separate entries for one mouse and were verified separately.
+   * That is not pedantry about provenance — the failure mode is silent.
+   * `razerDecodeButtonMapping` reads `type=0x00, len=0x00, value=0x00` as
+   * "Disabled", so a transport that does not implement the class answers
+   * all-zero and yields a full, ordinary-looking set of controls that every
+   * read reports as Disabled and every write appears to accept.
+   * `readButtonMappings`'s null-collapse cannot catch it, because the dict
+   * comes back populated.
+   */
+  buttonMapping?: boolean;
+  /**
+   * The older Chroma lighting commands (class `0x03`: the `0x0a` effect write
+   * and the backlight brightness pair). OpenRazer drives some Chroma-era mice
+   * this way and others through the extended matrix or plain led commands, and
+   * nothing on the wire says which, so this is an allowlist like
+   * `buttonMapping`. The effect write has no read-back, so a mouse that
+   * accepts it and ignores it would look exactly like one that obeys; only a
+   * hardware run can tell.
+   */
+  standardMatrixLighting?: boolean;
+  /** Volatile, zero-based RGB cells using the single-row custom-frame command. */
+  oneRowCustomFrameLedCount?: number;
+  /**
+   * The extended-matrix lighting commands (class `0x0f`: effect `0x02` and
+   * the brightness pair `0x04`/`0x84`) on transaction id `0x1f`, addressed per
+   * led: all, scroll wheel and logo. OpenRazer drives the Basilisk V3 family
+   * this way. Same caveat as `standardMatrixLighting`: the effect write has no
+   * read-back, so only a hardware run proves the mouse obeys it.
+   */
+  extendedMatrixLighting?: boolean;
   /** Also accept a vendor-defined collection as the control interface. */
   vendorControlInterface?: boolean;
   /** DPI storage selector; some generations use the no-store command form. */
@@ -87,6 +123,14 @@ export interface RazerProduct {
    * the older HyperSpeed receivers are wireless and only answer the legacy one.
    */
   highRatePolling: boolean;
+  /**
+   * Commit an extended polling change with a second write, selector `0x01`,
+   * on this transaction id. OpenRazer sends the ordinary selector-`0x00`
+   * write first. The HyperPolling dongle puts the commit on `0xff`; the wired
+   * DeathAdder V3 and the wireless Viper V3 Pro keep both writes on `0x1f`.
+   * Omitted when one write is enough.
+   */
+  extendedPollingCommitTransactionId?: number;
   /**
    * The mouse implements the class `0x0b` tracking distance.
    *
@@ -119,6 +163,18 @@ export interface RazerProduct {
    * the WebHID picker.
    */
   nativeOnly?: boolean;
+  /**
+   * Polling rates and which command encodes them follow the paired mouse, not a
+   * fixed list for this product id. The driver probes which command answers and
+   * offers the matching 1 kHz or 8 kHz ladder. `pollingRates` / `highRatePolling`
+   * are then only the pre-probe defaults. Mouse Dock Pro is the only case.
+   */
+  probePollingRates?: boolean;
+  /**
+   * Link label used instead of "HyperSpeed receiver" / "Wired USB" — for docks
+   * that are neither.
+   */
+  connectionLabel?: string;
 }
 
 /** Everything a preset supplies. The transaction id is deliberately not here. */
@@ -172,10 +228,23 @@ const TRANSACTION_3F: readonly number[] = [
 const TRANSACTION_1F: readonly number[] = [
   0x0062, 0x006c, 0x0077, 0x0080, 0x0085, 0x0086, 0x0088, 0x008d, 0x008f,
   0x0090, 0x0094, 0x0096, 0x0099, 0x009a, 0x009c, 0x009e, 0x009f, 0x00a1,
-  0x00a5, 0x00a6, 0x00a7, 0x00a8, 0x00aa, 0x00ab, 0x00af, 0x00b0, 0x00b2,
+  // Mouse Dock Pro is not in OpenRazer's mouse table; hardware with a Naga V2
+  // Pro paired answers on `0x1f` like that generation's mice.
+  0x00a4, 0x00a5, 0x00a6, 0x00a7, 0x00a8, 0x00aa, 0x00ab, 0x00af, 0x00b0, 0x00b2, 0x00b3,
   0x00b4, 0x00b6, 0x00b7, 0x00b8, 0x00b9, 0x00be, 0x00bf, 0x00c0, 0x00c1,
   0x00c2, 0x00c3, 0x00c4, 0x00c5, 0x00c7, 0x00c8, 0x00cb, 0x00cc, 0x00cd,
   0x00d0, 0x00d1, 0x00d3, 0x00d4, 0x00d6, 0x00d7,
+  // Viper V3 Pro SE. OpenRazer PR #2818 subclasses the Viper V3 Pro classes,
+  // and the transaction id is a property of those classes — so the id comes
+  // from the same source as `0x00c0`/`0x00c1` above rather than from the family
+  // name. The SE reference separately mentions `0xff`, but only for the
+  // HyperPolling dongle indicator command, which this driver does not send.
+  0x00de, 0x00df,
+  // DeathAdder V4 Pro Carbon Fiber Edition. Same electronics as `0x00be`/
+  // `0x00bf` under a cosmetic SKU (Razer's own live `AvailableDevices.json`
+  // groups them the same way, receiver id one above the mouse id), so it
+  // shares that pair's transaction id — not independently audited.
+  0x00ef, 0x00f0,
 ];
 
 /**
@@ -201,6 +270,11 @@ const DPI_CHROMA = 16_000;
 const DPI_FOCUS = 20_000;
 const DPI_FOCUS_PRO = 30_000;
 const DPI_FOCUS_PRO_35K = 35_000;
+// DeathAdder V4 Pro only. OpenRazer PR #2508 documents this model's own
+// `DPI_MAX = 45000` (and raised the shared set-DPI clamp to match) — a higher
+// ceiling than the rest of the 35K-sensor generation above, so it gets its
+// own constant rather than reusing DPI_FOCUS_PRO_35K.
+const DPI_DEATHADDER_V4_PRO = 45_000;
 
 /**
  * Chroma-era and older wired mice. OpenRazer's `standard` group answers on the
@@ -338,6 +412,10 @@ const VIPER_V3_PRO = {
   hasBattery: true,
   liftOff: true,
   asymmetricLiftOff: true,
+  // Class 0x02 is confirmed on both of this model's connections, so it belongs
+  // on the shared preset rather than on one product id. It sat on `0x00c1`
+  // alone while only the receiver had been exercised.
+  buttonMapping: true,
   verified: true,
 } as const;
 
@@ -353,7 +431,19 @@ const PRODUCT_DEFINITIONS: ReadonlyArray<[number, Omit<RazerProduct, "transactio
   [0x00a5, { model: "Viper V2 Pro", wireless: false, highRatePolling: false, ...VIPER_V2_PRO }],
   [0x00a6, { model: "Viper V2 Pro", wireless: true, highRatePolling: true, ...VIPER_V2_PRO }],
   [0x00c0, { model: "Viper V3 Pro", wireless: false, pollingRates: RATES_1K, highRatePolling: false, ...VIPER_V3_PRO }],
-  [0x00c1, { model: "Viper V3 Pro", wireless: true, pollingRates: RATES_8K, highRatePolling: true, ...VIPER_V3_PRO }],
+  // Issue #228: the live extended write applied but the rate reverted once the
+  // mouse powered off. OpenRazer follows selector `0x00` with `0x01` on the same
+  // `0x1f` transaction for `VIPER_V3_PRO_WIRELESS` — the store, not just the
+  // live register. The wired id is not in OpenRazer's commit list, so it keeps
+  // the single write.
+  [0x00c1, {
+    model: "Viper V3 Pro",
+    wireless: true,
+    pollingRates: RATES_8K,
+    highRatePolling: true,
+    ...VIPER_V3_PRO,
+    extendedPollingCommitTransactionId: RAZER_TRANSACTION_ID_1F,
+  }],
   [0x006e, { model: "DeathAdder Essential", ...DEATHADDER_ESSENTIAL }],
   [0x0071, { model: "DeathAdder Essential White Edition", ...DEATHADDER_ESSENTIAL }],
   [0x0098, { model: "DeathAdder Essential (2021)", ...DEATHADDER_ESSENTIAL }],
@@ -384,7 +474,13 @@ const PRODUCT_DEFINITIONS: ReadonlyArray<[number, Omit<RazerProduct, "transactio
   [0x0045, { model: "Mamba", ...STANDARD_WIRELESS }],
   [0x0046, { model: "Mamba Tournament Edition", ...STANDARD }],
   [0x0048, { model: "Orochi (Wired)", ...STANDARD, maxDpi: DPI_PRE_CHROMA }],
-  [0x004c, { model: "Diamondback Chroma", ...STANDARD }],
+  // Verified on firmware 1.0 over the cable, through OpenMouse Bridge on
+  // Windows: identity, DPI (1800) and polling (500 Hz) read back, and 800 DPI
+  // and 1000 Hz each wrote, read back and were restored. The polling sampler
+  // saw dropouts, so the rate was read back but not measured. The stage read
+  // gave nothing usable, so no stage editor is offered. Lighting follows
+  // OpenRazer's standard-matrix commands and has not been tried on it yet.
+  [0x004c, { model: "Diamondback Chroma", ...STANDARD, verified: true, standardMatrixLighting: true, oneRowCustomFrameLedCount: 21 }],
   [0x004f, { model: "DeathAdder 2000", ...STANDARD, maxDpi: 2000 }],
   [0x0050, { model: "Naga Hex V2", ...STANDARD }],
   [0x0053, { model: "Naga Chroma", ...STANDARD }],
@@ -409,12 +505,45 @@ const PRODUCT_DEFINITIONS: ReadonlyArray<[number, Omit<RazerProduct, "transactio
   // polling command cannot encode.
   [0x0091, { model: "Viper 8KHz", ...STANDARD, maxDpi: DPI_FOCUS, pollingRates: RATES_8K, highRatePolling: true }],
   [0x00a1, { model: "DeathAdder V2 Lite", ...STANDARD, maxDpi: 8500 }],
-  [0x00b2, { model: "DeathAdder V3", ...STANDARD, maxDpi: DPI_FOCUS_PRO }],
-
+  // Hardware report: the legacy read `00/85` comes back with status 0x05 (not
+  // supported) and the extended read `00/c0` answers 8000/4, so the mouse was
+  // already sitting at 2000 Hz while this row still offered a 1000 Hz ceiling.
+  // Wired, like the Viper 8KHz above, but HyperPolling is the point of the
+  // model and the legacy command cannot encode it.
+  //
+  // The extended write alone does not stick. Issue #222: an 8000 → 2000
+  // write was acknowledged and the read-back stayed at 8000. OpenRazer
+  // (`razer_attr_write_poll_rate`) follows selector `0x00` with selector
+  // `0x01`, both on transaction `0x1f` — not the dongle's `0xff` commit.
+  [0x00b2, {
+    model: "DeathAdder V3",
+    ...STANDARD,
+    maxDpi: DPI_FOCUS_PRO,
+    pollingRates: RATES_8K,
+    highRatePolling: true,
+    extendedPollingCommitTransactionId: RAZER_TRANSACTION_ID_1F,
+  }],
+  // Standalone HyperPolling Wireless Dongle. OpenRazer reads extended polling
+  // with transaction 0x1f and commits a change with two writes: selector 0x00
+  // on 0x1f, then selector 0x01 on 0xff. Settings are forwarded to the paired
+  // mouse, so expose the Focus Pro ceiling used by the DeathAdder V3 Pro while
+  // leaving the entry unverified until OpenMouse hardware captures it.
+  [0x00b3, {
+    model: "HyperPolling Wireless Dongle",
+    ...HYPERPOLLING_RECEIVER,
+    transport: "viper-receiver",
+    maxDpi: DPI_FOCUS_PRO,
+    vendorControlInterface: true,
+    extendedPollingCommitTransactionId: RAZER_TRANSACTION_ID_FF,
+    connectionLabel: "HyperPolling Wireless Dongle",
+  }],
   // ---- index3: wired, control channel on USB interface 3 --------------------
   [0x0096, { model: "Naga X", ...INDEX3, maxDpi: 18_000 }],
-  [0x0099, { model: "Basilisk V3", ...INDEX3, maxDpi: 26_000 }],
-  [0x00cb, { model: "Basilisk V3 35K", ...INDEX3, maxDpi: DPI_FOCUS_PRO_35K }],
+  // Lighting follows OpenRazer's extended-matrix commands for these two ids
+  // (wave, spectrum, static and brightness on the all/scroll/logo leds, all on
+  // 0x1f) and has not been tried on hardware yet.
+  [0x0099, { model: "Basilisk V3", ...INDEX3, maxDpi: 26_000, extendedMatrixLighting: true }],
+  [0x00cb, { model: "Basilisk V3 35K", ...INDEX3, maxDpi: DPI_FOCUS_PRO_35K, extendedMatrixLighting: true }],
 
   // ---- atheris-receiver: longer receiver wait -------------------------------
   [0x0062, { model: "Atheris", ...ATHERIS_RECEIVER, maxDpi: 7200 }],
@@ -422,6 +551,7 @@ const PRODUCT_DEFINITIONS: ReadonlyArray<[number, Omit<RazerProduct, "transactio
 
   // ---- viper-receiver -------------------------------------------------------
   [0x007a, { model: "Viper Ultimate (Wired)", ...VIPER_RECEIVER_WIRED }],
+
   // Confirmed on hardware (PR #45): the dongle's Generic-Desktop-Mouse
   // interface is Chrome-protected, so every collection is feat[none] and
   // sendFeatureReport fails on any id. Native HAL only.
@@ -448,7 +578,65 @@ const PRODUCT_DEFINITIONS: ReadonlyArray<[number, Omit<RazerProduct, "transactio
   // check before trusting it.
   [0x00b8, { model: "Viper V3 HyperSpeed", ...VIPER_RECEIVER_WIRELESS, highRatePolling: false, liftOff: true, maxDpi: DPI_FOCUS_PRO, verified: true }],
 
+  // Viper V3 Pro SE (`RZ01-0455`). OpenRazer PR #2818 implements it by
+  // subclassing the Viper V3 Pro rather than writing a new codec, so the packet
+  // format, the DPI pair and the extended polling commands are the same ones
+  // `0x00c0`/`0x00c1` already use.
+  //
+  // Two things are deliberately not inherited from that pair. `verified` stays
+  // false — nothing has connected one here, and the V3 Pro's flag was earned by
+  // a hardware report on its own product ids. `liftOff` stays false because it
+  // cannot be probed: a mouse without the feature answers `0x0b`/`0x85` with
+  // status `0x02` and zeros, which decodes as a legitimate "Low".
+  //
+  // Polling: settled on hardware, and it went the other way from OpenRazer.
+  // `0x00df` first shipped here with the 8 kHz ladder because OpenRazer's SE
+  // wireless class exposes it. A capture on the stock HyperSpeed receiver has
+  // the extended read (`0x00`/`0xc0`) answered with status `0x05` — not
+  // supported — and the legacy read (`0x00`/`0x85`) answering a divisor of 1,
+  // i.e. 1000 Hz. An outright refusal, not a write that confirms and does
+  // nothing, so this needs no rate measurement to settle.
+  //
+  // Razer's own specification agrees: "1000 Hz normally, up to 8000 Hz with
+  // HyperPolling Dongle". The dongle is a different receiver and would enumerate
+  // as its own product id; this row describes the one in the box.
+  [0x00de, {
+    model: "Viper V3 Pro SE (Wired)",
+    ...VIPER_RECEIVER_WIRED,
+    maxDpi: DPI_FOCUS_PRO_35K,
+    // Which interface carries the control channel has not been established for
+    // this model, so accept the vendor-defined shape as well as the plain
+    // mouse one and let the exchange itself reject what cannot answer.
+    vendorControlInterface: true,
+  }],
+  [0x00df, {
+    model: "Viper V3 Pro SE",
+    ...VIPER_RECEIVER_WIRELESS,
+    maxDpi: DPI_FOCUS_PRO_35K,
+    pollingRates: RATES_1K,
+    highRatePolling: false,
+    vendorControlInterface: true,
+  }],
+
   // ---- new-receiver ---------------------------------------------------------
+  // Dock, not a mouse: settings pass through to whichever mouse is paired.
+  // Polling rates are discovered per session — a Naga stays on the 1 kHz ladder,
+  // while a HyperPolling-capable mouse unlocks the 8 kHz one.
+  [0x00a4, {
+    model: "Mouse Dock Pro",
+    ...MODERN_RECEIVER,
+    // Verified only with a Naga V2 Pro paired (Focus Pro 30k). A higher dock
+    // ceiling for 35k mice is untested through this path, so keep the observed
+    // sensor limit rather than advertising an unverified range.
+    maxDpi: DPI_FOCUS_PRO,
+    probePollingRates: true,
+    connectionLabel: "Mouse Dock Pro",
+    // Conservative pre-probe defaults; `readPollingRateHz` replaces both once
+    // it knows which command the paired mouse answers.
+    pollingRates: RATES_1K,
+    highRatePolling: true,
+    verified: true,
+  }],
   [0x006f, { model: "Lancehead Wireless", ...LEGACY_RECEIVER, maxDpi: DPI_CHROMA }],
   [0x0070, { model: "Lancehead Wireless (Wired)", ...MODERN_WIRED, maxDpi: DPI_CHROMA }],
   [0x0072, { model: "Mamba Wireless", ...LEGACY_RECEIVER, maxDpi: DPI_CHROMA }],
@@ -462,14 +650,17 @@ const PRODUCT_DEFINITIONS: ReadonlyArray<[number, Omit<RazerProduct, "transactio
   [0x0090, { model: "Naga Pro", ...LEGACY_RECEIVER }],
   [0x009a, { model: "Pro Click Mini", ...LEGACY_RECEIVER, maxDpi: 12_000 }],
   [0x009c, { model: "DeathAdder V2 X HyperSpeed", ...LEGACY_RECEIVER, maxDpi: 14_000 }],
-  [0x00a7, { model: "Naga V2 Pro (Wired)", ...MODERN_WIRED, maxDpi: DPI_FOCUS_PRO }],
-  [0x00a8, { model: "Naga V2 Pro", ...MODERN_RECEIVER, maxDpi: DPI_FOCUS_PRO }],
+  [0x00a7, { model: "Naga V2 Pro (Wired)", ...MODERN_WIRED, maxDpi: DPI_FOCUS_PRO, verified: true }],
+  [0x00a8, { model: "Naga V2 Pro", ...MODERN_RECEIVER, maxDpi: DPI_FOCUS_PRO, verified: true }],
   [0x00aa, { model: "Basilisk V3 Pro (Wired)", ...MODERN_WIRED, maxDpi: DPI_FOCUS_PRO }],
   [0x00ab, { model: "Basilisk V3 Pro", ...MODERN_RECEIVER, maxDpi: DPI_FOCUS_PRO }],
   [0x00af, { model: "Cobra Pro (Wired)", ...MODERN_WIRED, maxDpi: DPI_FOCUS_PRO }],
   [0x00b0, { model: "Cobra Pro", ...MODERN_RECEIVER, maxDpi: DPI_FOCUS_PRO }],
   [0x00b4, { model: "Naga V2 HyperSpeed", ...LEGACY_RECEIVER, maxDpi: DPI_FOCUS_PRO }],
-  [0x00b6, { model: "DeathAdder V3 Pro (Wired)", ...MODERN_WIRED, maxDpi: DPI_FOCUS_PRO }],
+  // Verified on firmware 2.1 over the cable: same 13 write/read-back steps as
+  // the receiver below, polling measured (126 Hz peak at 125), battery reads
+  // "Charging" and climbs while plugged in.
+  [0x00b6, { model: "DeathAdder V3 Pro (Wired)", ...MODERN_WIRED, maxDpi: DPI_FOCUS_PRO, verified: true }],
   // Hardware report: the extended command is accepted and reads back, but the
   // measured report rate stays at 1000 Hz whatever is written. This model ships
   // with the stock 1000 Hz HyperSpeed receiver, not the 8000 Hz HyperPolling
@@ -477,13 +668,32 @@ const PRODUCT_DEFINITIONS: ReadonlyArray<[number, Omit<RazerProduct, "transactio
   // encoding was addressing a ceiling the hardware does not have. `0x00c3` is
   // the same model on a second product id and is likely the same, but nobody
   // has measured it — see TESTING.md.
-  [0x00b7, { model: "DeathAdder V3 Pro", ...MODERN_RECEIVER, highRatePolling: false, maxDpi: DPI_FOCUS_PRO }],
+  //
+  // Verified on firmware 2.1 with the legacy command: 125/500/1000 Hz each
+  // round-tripped AND measured (124 Hz and 842 Hz peak `pointerrawupdate` at
+  // 125 and 1000), DPI, auto sleep and low power persisted across a reconnect
+  // and a power cycle. The wired `0x00b6` above was verified the same way.
+  [0x00b7, { model: "DeathAdder V3 Pro", ...MODERN_RECEIVER, highRatePolling: false, maxDpi: DPI_FOCUS_PRO, verified: true }],
   [0x00b9, { model: "Basilisk V3 X HyperSpeed", ...LEGACY_RECEIVER, maxDpi: 18_000 }],
-  // The control channel is on a Chrome-protected collection: with Synapse fully
-  // stopped the diagnostics harness got "no feature report channel" on every
-  // interface, in both the wired and wireless roles. Native HAL only.
-  [0x00be, { model: "DeathAdder V4 Pro (Wired)", ...MODERN_WIRED, maxDpi: DPI_FOCUS_PRO_35K, nativeOnly: true }],
-  [0x00bf, { model: "DeathAdder V4 Pro", ...HYPERPOLLING_RECEIVER, nativeOnly: true }],
+  // Was nativeOnly: the control channel used to sit on a Chrome-protected
+  // collection (with Synapse fully stopped the diagnostics harness got "no
+  // feature report channel" on every interface, wired and wireless both —
+  // see git blame). Razer's own live `AvailableDevices.json` on Synapse Web
+  // now lists this model (productId 190/191, i.e. 0x00be/0x00bf), meaning a
+  // firmware or descriptor update moved the control channel off that
+  // collection. Re-tested and confirmed reachable over WebHID.
+  // OpenRazer PR #2508: both the cable and the HyperPolling dongle reach
+  // 8000 Hz on this model (the wired half is not capped at MODERN_WIRED's
+  // usual 1000 Hz — a HyperPolling receiver ships in the box, so the cable
+  // gets the same ceiling as the dongle).
+  [0x00be, { model: "DeathAdder V4 Pro (Wired)", ...MODERN_WIRED, pollingRates: RATES_8K, highRatePolling: true, maxDpi: DPI_DEATHADDER_V4_PRO }],
+  [0x00bf, { model: "DeathAdder V4 Pro", ...HYPERPOLLING_RECEIVER, maxDpi: DPI_DEATHADDER_V4_PRO }],
+  // Carbon Fiber Edition — cosmetic SKU on its own product ids, listed
+  // alongside 0x00be/0x00bf in Razer's live AvailableDevices.json
+  // (productId 239/240). Not independently hardware-tested; same specs
+  // assumed as the standard edition until proven otherwise.
+  [0x00ef, { model: "DeathAdder V4 Pro Carbon Fiber Edition (Wired)", ...MODERN_WIRED, pollingRates: RATES_8K, highRatePolling: true, maxDpi: DPI_DEATHADDER_V4_PRO }],
+  [0x00f0, { model: "DeathAdder V4 Pro Carbon Fiber Edition", ...HYPERPOLLING_RECEIVER, maxDpi: DPI_DEATHADDER_V4_PRO }],
   [0x00c2, { model: "DeathAdder V3 Pro (Wired)", ...MODERN_WIRED, maxDpi: DPI_FOCUS_PRO }],
   [0x00c3, { model: "DeathAdder V3 Pro", ...MODERN_RECEIVER, maxDpi: DPI_FOCUS_PRO }],
   [0x00c4, { model: "DeathAdder V3 HyperSpeed (Wired)", ...MODERN_WIRED, maxDpi: DPI_FOCUS_PRO }],
@@ -515,4 +725,3 @@ export const RAZER_PRODUCTS: ReadonlyMap<number, RazerProduct> = new Map(
 
 /** Product ids for the WebHID picker filters in `../vendors.ts`. */
 export const RAZER_PRODUCT_IDS: readonly number[] = [...RAZER_PRODUCTS.keys()];
-

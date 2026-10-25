@@ -53,10 +53,63 @@ const PROFILE_FORMAT_NAMES: Record<number, string> = {
  * hardware sanity check on a G502/G403-family device is still required before
  * release — see docs/logitech-onboard-profiles.md.
  */
-const VERIFIED_FORMATS = new Set([2, 3, 4, 7]);
-const WRITABLE_FORMATS = new Set([2, 4, 7]);
+/**
+ * Format 8 (PRO X 2 / PRO X 3 Superstrike) joins this set on a CRC-matching
+ * full dump: profile sector 1 from a PRO X 3 diagnostic, all 255 bytes, checks
+ * out against its own stored CRC (0x2a38, identical on the PRO X 2). That
+ * confirms the layout, so profiles can be opened, switched and enabled.
+ */
+const VERIFIED_FORMATS = new Set([2, 3, 4, 7, 8]);
+/**
+ * Format 8 is a testing-phase addition: the same base-v6 stage table and write
+ * sequence format 7 already proved on hardware, and its layout is verified, but
+ * a DPI write to it has been confirmed on hardware (a PRO X 3 Superstrike), and
+ * the per-stage lift-off byte sits in the same 5-byte stage entries. Both are
+ * written; openActiveProfile() still re-reads the live sector and refuses on a
+ * bad CRC. Pull it back out if a write-then-reconnect check does not come back
+ * clean.
+ */
+const WRITABLE_FORMATS = new Set([2, 3, 4, 7, 8]);
 const PROFILE_WRITE_PROBE_FORMATS = new Set([2, 3, 4]);
-const FACTORY_RESET_FORMATS = new Set([7]);
+const FACTORY_RESET_FORMATS = new Set([7, 8]);
+
+/** Whether profile-content writes for `profileFormatId` are trusted at all. */
+export function isProfileWritable(profileFormatId: number | null | undefined): boolean {
+  return profileFormatId !== null && profileFormatId !== undefined && WRITABLE_FORMATS.has(profileFormatId);
+}
+
+/**
+ * Format 7's per-stage lift-off byte (and the rest of its DPI-stage triplet
+ * layout) was recovered from a Pro X Superlight 2 dump. A PID 0xc094 (the
+ * original G Pro X Superlight, wpid 4093 — Logitech's "PRO X Wireless" in its
+ * own tooling) was then reported to return HID++ error 0x05 ("Logitech
+ * internal error") when a stage's lift-off byte is written, matching an
+ * unresolved report of a differently-shifted DPI stage layout.
+ *
+ * That report was later pinned to format 7: a sector-1 dump from a real
+ * 0xc094 (main app MPM25.01_B0018) reports profile format 4, i.e. the base v1
+ * scalar table, which has no per-stage lift-off field at all — see the "PRO X
+ * Wireless dump" test. The guard therefore cannot fire against a base-v1
+ * layout and only matters if a unit ever reports a v6 format; it is kept for
+ * that case, because lifting it on a real format-7 board would bring the 0x05
+ * back. Everything else a format-7 profile carries — DPI x/y, report rate,
+ * angle-snap, name, buttons — stays writable, and only the lift-off byte for
+ * each stage is left untouched.
+ */
+const UNVERIFIED_LOD_PRODUCT_IDS = new Set([0xc094]);
+
+/** Whether the per-stage lift-off byte is trusted to write on this specific device. */
+export function isLodWritableForProduct(
+  profileFormatId: number | null | undefined,
+  productId: number | null | undefined,
+): boolean {
+  if (!isProfileWritable(profileFormatId)) return false;
+  // Base v1 (formats 1-5) stores one scalar DPI per slot and has no lift-off
+  // byte, so there is nothing for the product guard to refuse.
+  if ((profileFormatId ?? 0) < 6) return true;
+  if (productId !== null && productId !== undefined && UNVERIFIED_LOD_PRODUCT_IDS.has(productId)) return false;
+  return true;
+}
 
 /** Whether this format has a reversible guided write probe. */
 export function supportsProfileWriteProbe(profileFormatId: number | null | undefined): boolean {
@@ -207,6 +260,17 @@ const FORMAT_CAPABILITIES: Record<number, ProfileFormatCapabilities> = {
     maxNameLength: PROFILE_NAME_MAX_CHARS,
     bunnyHop: false,
   },
+  // A G703 on format 3 reported four of five scalar slots, 50-12000 DPI in
+  // steps of 50, and 125/250/500/1000 Hz. Name, default-slot DPI, and wired
+  // rate writes were applied, confirmed live, and restored.
+  3: {
+    supportedLods: [],
+    lodEncoding: LOD_ENCODING,
+    dpiStages: { maxStages: 5, minDpi: 50, maxDpi: 12000, stepDpi: 50 },
+    reportRates: { wirelessMaxHz: 1000, wiredMaxHz: 1000 },
+    maxNameLength: PROFILE_NAME_MAX_CHARS,
+    bunnyHop: false,
+  },
   // A G102 LIGHTSYNC on format 4 reported five scalar slots, 50-8000 DPI in
   // steps of 50, and 125/250/500/1000 Hz through the capability collector.
   // Its DPI, rate, and name writes were applied, read back live, and restored.
@@ -231,14 +295,22 @@ const FORMAT_CAPABILITIES: Record<number, ProfileFormatCapabilities> = {
     bunnyHop: true,
   },
   // Format 8 carries the analog-button block, so it is the PRO X 2 Superstrike
-  // format. Its two levels are what the driver has always offered and were
-  // never checked against a real device; its sensor range was never captured
-  // either, so slots stay unavailable rather than being assumed to match
-  // format 7.
+  // format. Confirmed from two user diagnostics, a PRO X 2 and a PRO X 3
+  // Superstrike, whose profile sector 1 (raw memory reads) decode to the same
+  // five factory stages - 800/1200/1600/2400/3200, all X=Y linked - at the
+  // same 2-index + 5x5-byte layout base v6 already uses, matching format 7's
+  // geometry exactly. Every stage's stored lift-off byte was 2, which
+  // LOD_ENCODING reads as "Medium" - a level the old two-entry list never
+  // allowed, so it was simply wrong, not just unconfirmed. The DPI range is
+  // the widest grid seen: the PRO X 3's 0x2202 list runs 100-48000 (steps of
+  // 1/2/5/10/20/50/100/125/200 across its ranges), stored as plain 16-bit
+  // values; callers narrow it to the connected sensor's own list, so an older
+  // sensor is never offered the X3's ceiling. Writable as a testing-phase step -
+  // see WRITABLE_FORMATS.
   8: {
-    supportedLods: ["Low", "High"],
+    supportedLods: ["Low", "Medium", "High"],
     lodEncoding: LOD_ENCODING,
-    dpiStages: null,
+    dpiStages: { maxStages: 5, minDpi: 100, maxDpi: 48000, stepDpi: 50 },
     // Captured behavior: the wireless link reaches 8 kHz while USB is capped
     // at 1 kHz. Transport selection is resolved from HID++ identity data.
     reportRates: { wirelessMaxHz: 8000, wiredMaxHz: 1000 },
@@ -296,7 +368,9 @@ export function decodeLiftOffLevel(
 export interface OnboardProfilesInfo {
   memoryModelId: number;
   profileFormatId: number;
+  macroFormatId: number;
   profileCount: number;
+  buttonCount: number;
   sectorCount: number;
   sectorSize: number;
 }
@@ -331,9 +405,145 @@ export interface OnboardProfile {
    * three confirmed on hardware; 0xff is unwritten flash and decodes as null.
    */
   bunnyHoppingMs: number | null;
+  buttonAssignments: OnboardButtonAssignment[];
+  gShiftAssignments: OnboardButtonAssignment[];
   crcValid: boolean;
   /** Raw sector, kept so captures can diff before/after a vendor-app change. */
   raw: Uint8Array;
+}
+
+export type LogitechButtonAction =
+  | "Disabled" | "Left click" | "Right click" | "Middle click" | "Back" | "Forward"
+  | "Tilt left" | "Tilt right" | "Next DPI" | "Previous DPI" | "Cycle DPI"
+  | "Default DPI" | "DPI Shift" | "Next profile" | "Previous profile"
+  | "Cycle profiles" | "G-Shift" | "Battery indicator";
+
+export interface OnboardButtonAssignment {
+  button: number;
+  action: LogitechButtonAction | "Custom";
+  raw: readonly number[];
+}
+
+export type LogitechButtonBinding =
+  | { kind: "action"; action: LogitechButtonAction }
+  | { kind: "keyboard"; key: number; modifiers: number }
+  | { kind: "consumer"; usage: number };
+
+export interface LogitechMacroStep {
+  key: number;
+  modifiers: number;
+  /** Pause before this chord, in milliseconds. */
+  delayMs: number;
+}
+
+/** Encodes the HID++ macro format used by G502 onboard-memory sectors. */
+export function encodeMacroSector(sectorSize: number, steps: readonly LogitechMacroStep[]): Uint8Array {
+  if (!Number.isInteger(sectorSize) || sectorSize < 6 || !steps.length) {
+    throw new Error("The macro sector geometry or sequence is invalid.");
+  }
+  const records: number[][] = [];
+  for (const [index, step] of steps.entries()) {
+    if (!Number.isInteger(step.key) || step.key < 1 || step.key > 0xff
+      || !Number.isInteger(step.modifiers) || step.modifiers < 0 || step.modifiers > 0xff
+      || !Number.isInteger(step.delayMs) || step.delayMs < 0 || step.delayMs > 0xffff) {
+      throw new Error("The macro contains an invalid key, modifier, or delay.");
+    }
+    if (index > 0 && step.delayMs > 0) records.push([0x40, step.delayMs >> 8, step.delayMs & 0xff]);
+    const modifiers = Array.from({ length: 8 }, (_, bit) => 1 << bit)
+      .filter((bit) => (step.modifiers & bit) !== 0);
+    for (const modifier of modifiers) records.push([0x43, modifier, 0x00]);
+    records.push([0x43, 0x00, step.key], [0x44, 0x00, step.key]);
+    for (const modifier of modifiers.reverse()) records.push([0x44, modifier, 0x00]);
+  }
+  records.push([0xff, 0xff, 0xff]);
+  if (records.length * 3 > sectorSize) throw new Error("That sequence is too long for one onboard macro sector.");
+  const result = new Uint8Array(sectorSize).fill(0xff);
+  records.forEach((record, index) => result.set(record, index * 3));
+  return result;
+}
+
+export function encodeMacroButtonAssignment(
+  profile: Uint8Array,
+  profileFormatId: number,
+  layer: "primary" | "g-shift",
+  button: number,
+  macroSector: number,
+): Uint8Array {
+  if (!Number.isInteger(macroSector) || macroSector < 1 || macroSector > 0xff) {
+    throw new Error("The macro sector cannot be represented by this profile format.");
+  }
+  const name = layer === "primary" ? "button_functions" : "g_shift_function";
+  const component = componentsForFormat(profileFormatId).find((candidate) => candidate.name === name);
+  if (!component || !Number.isInteger(button) || button < 0 || button >= component.size / 4) {
+    throw new Error("That button is outside this profile format's assignment table.");
+  }
+  const result = profile.slice();
+  result.set([0x00, button & 0xff, macroSector, 0x00], component.offset + button * 4);
+  return applyCrc(result);
+}
+
+export const LOGITECH_BUTTON_ACTIONS: readonly LogitechButtonAction[] = [
+  "Disabled", "Left click", "Right click", "Middle click", "Back", "Forward",
+  "Tilt left", "Tilt right", "Next DPI", "Previous DPI", "Cycle DPI", "Default DPI",
+  "DPI Shift", "Next profile", "Previous profile", "Cycle profiles", "G-Shift", "Battery indicator",
+];
+
+const ACTION_RECORDS: Readonly<Record<LogitechButtonAction, readonly number[]>> = {
+  Disabled: [0xff, 0xff, 0xff, 0xff],
+  "Left click": [0x80, 0x01, 0x00, 0x01],
+  "Right click": [0x80, 0x01, 0x00, 0x02],
+  "Middle click": [0x80, 0x01, 0x00, 0x04],
+  Back: [0x80, 0x01, 0x00, 0x08],
+  Forward: [0x80, 0x01, 0x00, 0x10],
+  "Tilt left": [0x90, 0x01, 0x00, 0x00],
+  "Tilt right": [0x90, 0x02, 0x00, 0x00],
+  "Next DPI": [0x90, 0x03, 0x00, 0x00],
+  "Previous DPI": [0x90, 0x04, 0x00, 0x00],
+  "Cycle DPI": [0x90, 0x05, 0x00, 0x00],
+  "Default DPI": [0x90, 0x06, 0x00, 0x00],
+  "DPI Shift": [0x90, 0x07, 0x00, 0x00],
+  "Next profile": [0x90, 0x08, 0x00, 0x00],
+  "Previous profile": [0x90, 0x09, 0x00, 0x00],
+  "Cycle profiles": [0x90, 0x0a, 0x00, 0x00],
+  "G-Shift": [0x90, 0x0b, 0x00, 0x00],
+  "Battery indicator": [0x90, 0x0c, 0x00, 0x00],
+};
+
+function decodeButtonAssignments(bytes: Uint8Array, component: ComponentSpec): OnboardButtonAssignment[] {
+  const result: OnboardButtonAssignment[] = [];
+  for (let button = 0; button < component.size / 4; button += 1) {
+    const raw = [...bytes.slice(component.offset + button * 4, component.offset + button * 4 + 4)];
+    if (raw.length < 4) break;
+    const action = (Object.entries(ACTION_RECORDS) as Array<[LogitechButtonAction, readonly number[]]>)
+      .find(([, record]) => record.every((value, index) => value === raw[index]))?.[0] ?? "Custom";
+    result.push({ button, action, raw });
+  }
+  return result;
+}
+
+export function encodeButtonAssignment(
+  sector: Uint8Array,
+  profileFormatId: number,
+  layer: "primary" | "g-shift",
+  button: number,
+  binding: LogitechButtonAction | LogitechButtonBinding,
+): Uint8Array {
+  const name = layer === "primary" ? "button_functions" : "g_shift_function";
+  const component = componentsForFormat(profileFormatId).find((candidate) => candidate.name === name);
+  if (!component || !Number.isInteger(button) || button < 0 || button >= component.size / 4) {
+    throw new Error("That button is outside this profile format's assignment table.");
+  }
+  const normalized: LogitechButtonBinding = typeof binding === "string"
+    ? { kind: "action", action: binding }
+    : binding;
+  const record = normalized.kind === "action"
+    ? ACTION_RECORDS[normalized.action]
+    : normalized.kind === "keyboard"
+      ? [0x80, 0x02, normalized.modifiers & 0xff, normalized.key & 0xff]
+      : [0x80, 0x03, (normalized.usage >> 8) & 0xff, normalized.usage & 0xff];
+  const result = sector.slice();
+  result.set(record, component.offset + button * 4);
+  return applyCrc(result);
 }
 
 /** Report-rate bytes index this table, matching 0x8061's ordering. */
@@ -426,6 +636,82 @@ const COMPONENTS_V6: ComponentSpec[] = [
 const BUNNY_HOPPING: ComponentSpec = { offset: 0x25, size: 1, name: "bunny_hopping" };
 const ANALOG_BUTTON: ComponentSpec = { offset: 0x26, size: 6, name: "analog_button" };
 
+/** One primary button's HITS settings as the profile stores them. */
+export interface AnalogButtonProfileValues {
+  actuation: number;
+  rapidTrigger: number;
+  haptics: number;
+  rapidTriggerEnabled: boolean;
+}
+
+const ANALOG_BUTTON_COUNT = 2;
+const ANALOG_BUTTON_BYTES = 3;
+
+/**
+ * HITS settings held in a format 8+ profile's `analog_button` block (offset
+ * 0x26, one three-byte entry per primary button). The bytes are the live 0x1B0C
+ * values verbatim: [actuation << 2, rapid trigger << 2 | on, haptics << 2].
+ *
+ * This copy is what the mouse loads at power-on. Writing only the live feature
+ * changes the working values, which a power cycle discards - a PRO X 3
+ * Superstrike booted back to the stored 5 / 2 (off) / 3 after every live-only
+ * change, and its stored block never changed in three captures.
+ */
+export function decodeAnalogButtons(
+  sector: Uint8Array,
+  profileFormatId: number,
+): AnalogButtonProfileValues[] | null {
+  if (profileFormatId < 8) return null;
+  return Array.from({ length: ANALOG_BUTTON_COUNT }, (_, button) => {
+    const base = ANALOG_BUTTON.offset + button * ANALOG_BUTTON_BYTES;
+    return {
+      actuation: (sector[base] ?? 0) >> 2,
+      rapidTrigger: (sector[base + 1] ?? 0) >> 2,
+      haptics: (sector[base + 2] ?? 0) >> 2,
+      rapidTriggerEnabled: ((sector[base + 1] ?? 0) & 0x01) === 1,
+    };
+  });
+}
+
+/**
+ * Writes HITS settings for the named primary buttons into a copy of the
+ * profile, leaving every other byte alone. A button whose `rapidTriggerEnabled`
+ * is left out keeps its stored on/off bit.
+ */
+export function encodeAnalogButtons(
+  sector: Uint8Array,
+  profileFormatId: number,
+  buttons: ReadonlyArray<{
+    button: number;
+    actuation: number;
+    rapidTrigger: number;
+    haptics: number;
+    rapidTriggerEnabled?: boolean;
+  }>,
+): Uint8Array {
+  if (profileFormatId < 8) throw new Error("This profile format has no analog button settings.");
+  const result = sector.slice();
+  for (const entry of buttons) {
+    if (!Number.isInteger(entry.button) || entry.button < 0 || entry.button >= ANALOG_BUTTON_COUNT) {
+      throw new Error("Analog button settings exist for the left and right primary buttons only.");
+    }
+    for (const value of [entry.actuation, entry.rapidTrigger, entry.haptics]) {
+      // Each value is stored in bits 7..2, so it has six bits.
+      if (!Number.isInteger(value) || value < 0 || value > 0x3f) {
+        throw new Error("An analog button setting is outside what the profile can store.");
+      }
+    }
+    const base = ANALOG_BUTTON.offset + entry.button * ANALOG_BUTTON_BYTES;
+    const enabledBit = entry.rapidTriggerEnabled === undefined
+      ? (result[base + 1] ?? 0) & 0x01
+      : entry.rapidTriggerEnabled ? 1 : 0;
+    result[base] = entry.actuation << 2;
+    result[base + 1] = (entry.rapidTrigger << 2) | enabledBit;
+    result[base + 2] = entry.haptics << 2;
+  }
+  return applyCrc(result);
+}
+
 export function componentsForFormat(profileFormatId: number): ComponentSpec[] {
   const components = profileFormatId >= 6 ? [...COMPONENTS_V6] : [...COMPONENTS_V1];
   if (profileFormatId >= 7) components.push(BUNNY_HOPPING);
@@ -448,7 +734,9 @@ export function parseProfilesInfo(reply: Uint8Array): OnboardProfilesInfo {
   return {
     memoryModelId: reply[3] ?? 0,
     profileFormatId: reply[4] ?? 0,
+    macroFormatId: reply[5] ?? 0,
     profileCount: reply[6] ?? 0,
+    buttonCount: reply[8] ?? 0,
     sectorCount: reply[9] ?? 0,
     sectorSize: ((reply[10] ?? 0) << 8) | (reply[11] ?? 0),
   };
@@ -515,13 +803,69 @@ const FACTORY_PROFILE_FORMAT_7 = `
   00 03 00 00 00 00 00 1f 40 32 00 00 03 84 db
 `;
 
+/**
+ * Complete factory profile for format 8 (PRO X 3 SUPERSTRIKE), captured over USB
+ * while G HUB reset every profile: all five profile sectors received this exact
+ * image, CRC 0x2a38. It includes the HITS defaults (actuation 5, rapid trigger 2
+ * off, haptics 3).
+ */
+const FACTORY_PROFILE_FORMAT_8 = `
+  03 03 00 00 20 03 20 03 02 b0 04 b0 04 02 40 06
+  40 06 02 60 09 60 09 02 80 0c 80 0c 02 00 00 00
+  00 ff 00 ff ff ff 14 08 0c 14 08 0c 3c 00 2c 01
+  80 01 00 01 80 01 00 02 80 01 00 04 80 01 00 08
+  80 01 00 10 ff ff ff ff ff ff ff ff ff ff ff ff
+  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+  03 00 00 00 00 00 1f 40 00 00 00 03 00 00 00 00
+  00 1f 40 00 00 00 03 00 00 00 00 00 1f 40 32 00
+  00 03 00 00 00 00 00 1f 40 32 00 00 03 2a 38
+`;
+
+const FACTORY_PROFILES: Record<number, string> = {
+  7: FACTORY_PROFILE_FORMAT_7,
+  8: FACTORY_PROFILE_FORMAT_8,
+};
+
 /** Returns a fresh, CRC-valid factory sector only for a captured geometry. */
 export function factoryProfileForFormat(profileFormatId: number, sectorSize: number): Uint8Array | null {
   if (!supportsFactoryReset(profileFormatId) || sectorSize !== 255) return null;
   return Uint8Array.from(
-    FACTORY_PROFILE_FORMAT_7.trim().split(/\s+/),
+    FACTORY_PROFILES[profileFormatId].trim().split(/\s+/),
     (byte) => Number.parseInt(byte, 16),
   );
+}
+
+/** Profile sectors a format 8 mouse ships with: 1 to 5, as G HUB's reset left them. */
+const FACTORY_DIRECTORY_SECTORS_FORMAT_8 = [1, 2, 3, 4, 5];
+
+/**
+ * The directory (sector 0) of a factory mouse: every profile listed, only the
+ * first enabled, rest of the sector erased. Captured from G HUB's reset on a
+ * PRO X 3 SUPERSTRIKE (CRC 0x4037); only captured for format 8.
+ */
+export function factoryDirectoryForFormat(profileFormatId: number, sectorSize: number): Uint8Array | null {
+  if (profileFormatId !== 8 || sectorSize !== 255) return null;
+  const directory = new Uint8Array(sectorSize).fill(0xff);
+  FACTORY_DIRECTORY_SECTORS_FORMAT_8.forEach((sector, index) => {
+    directory.set([sector >> 8, sector & 0xff, index === 0 ? 0x01 : 0x00, 0xff], index * 4);
+  });
+  return applyCrc(directory);
+}
+
+/**
+ * True when a directory sector lists no profiles at all, as on a mouse G HUB
+ * has never linked. Erased flash reads 0xffff; a first entry of 0x0000 is the
+ * other terminator parseDirectory stops on.
+ */
+export function isBlankDirectory(sector: Uint8Array): boolean {
+  return sector.length >= 4 && parseDirectory(sector).length === 0;
 }
 
 /**
@@ -601,6 +945,34 @@ function decodeLegacyReportRate(bytes: Uint8Array, offset: number | null): numbe
   if (intervalMs === undefined || intervalMs === 0xff || intervalMs === 0) return null;
   const hz = 1000 / intervalMs;
   return Number.isInteger(hz) ? hz : null;
+}
+
+/**
+ * USB transport ids (from the mouse's own HID++ identity, so they hold whether
+ * it is on the cable, on its receiver or on Bluetooth) whose cable carries the
+ * full report-rate range instead of the 1 kHz the rest of the format is capped
+ * at. The cap belongs to a product's USB interface, not to its profile format:
+ * the PRO X 2 Superstrike (C0A8) and PRO X 3 Superstrike (C0A9) share format 8,
+ * but a PRO X 3 diagnostic taken on the cable shows its 0x8061 feature
+ * advertising all seven rates through 8000 Hz (mask 0x7f) - the same mask it
+ * reports wirelessly - and G HUB offers 8 kHz on the cable. The PRO X 2's
+ * cable stays at its captured 1 kHz until it shows the same.
+ */
+const FULL_RATE_USB_TRANSPORT_IDS: ReadonlySet<string> = new Set(["C0A9"]);
+
+/**
+ * The report-rate ceilings for a mouse: the format's, with the cable lifted to
+ * the wireless ceiling for a product known to run the full range over USB.
+ */
+export function reportRateCapabilitiesFor(
+  profileFormatId: number | null | undefined,
+  usbTransportId: string | null | undefined,
+): ReportRateCapabilities | null {
+  const capabilities = capabilitiesForFormat(profileFormatId).reportRates;
+  if (!capabilities || !usbTransportId || !FULL_RATE_USB_TRANSPORT_IDS.has(usbTransportId.toUpperCase())) {
+    return capabilities;
+  }
+  return { ...capabilities, wiredMaxHz: capabilities.wirelessMaxHz };
 }
 
 /** Rates the byte can index, filtered to the ceiling for that connection. */
@@ -780,7 +1152,7 @@ export function validateDpiStagePlan(
     }
     if (legacyScalar) {
       if (stage.x !== stage.y) return `Slot ${index + 1} must use the same X and Y DPI.`;
-      if (stage.lod !== 0) return `Slot ${index + 1} cannot store lift-off distance.`;
+      // Lift-off is not stored here and the writer ignores it, so UI defaults must not fail the flash.
     } else if (!Number.isInteger(stage.lod) || stage.lod < 1 || stage.lod > 3) {
       // 0 is the "unused stage" marker on formats with per-stage lift-off.
       return `Slot ${index + 1} has an invalid lift-off level.`;
@@ -819,6 +1191,13 @@ export function encodeDpiStages(
   profileFormatId: number,
   plan: DpiStagePlan,
   capabilitiesOverride?: DpiStageCapabilities | null,
+  /**
+   * False on hardware where the per-stage lift-off byte is unverified (see
+   * isLodWritableForProduct): the stage's x/y still get the plan's values,
+   * but its lift-off byte is left exactly as read rather than overwritten,
+   * since this format may not have lift-off storage there at all.
+   */
+  writeLod = true,
 ): Uint8Array {
   const legacyScalar = profileFormatId < 6;
   const capabilities = capabilitiesOverride === undefined
@@ -849,12 +1228,12 @@ export function encodeDpiStages(
     if (!entry) {
       result[base] = 0; result[base + 1] = 0;
       result[base + 2] = 0; result[base + 3] = 0;
-      result[base + 4] = 0;
+      if (writeLod) result[base + 4] = 0;
       continue;
     }
     writeUint16LE(result, base, entry.x);
     writeUint16LE(result, base + 2, entry.y);
-    result[base + 4] = entry.lod;
+    if (writeLod) result[base + 4] = entry.lod;
   }
   return applyCrc(result);
 }
@@ -986,6 +1365,9 @@ export function decodeOnboardProfile(
     ? { stages: [], defaultIndex: null }
     : legacyLayout ? decodeLegacyDpi(bytes, layout.dpi) : decodeDpi(bytes, layout.dpi);
   const angleSnappingByte = bytes[layout.angleSnapping];
+  const components = componentsForFormat(profileFormatId);
+  const buttons = components.find((component) => component.name === "button_functions")!;
+  const gShift = components.find((component) => component.name === "g_shift_function")!;
 
   return {
     sector: entry.sector,
@@ -1012,6 +1394,8 @@ export function decodeOnboardProfile(
       ? null
       : readUint16LE(bytes, layout.powerOffTimeout),
     bunnyHoppingMs: decodeBunnyHoppingMs(bytes, layout.bunnyHopping),
+    buttonAssignments: decodeButtonAssignments(bytes, buttons),
+    gShiftAssignments: decodeButtonAssignments(bytes, gShift),
     crcValid: bytes.length > 2 && profileCrc(bytes) === storedCrc(bytes),
     raw: bytes,
   };

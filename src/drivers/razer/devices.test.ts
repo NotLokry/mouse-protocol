@@ -50,6 +50,24 @@ const VERIFIED_SINCE: ReadonlyArray<[number, VerifiedProfile]> = [
   // command is refused as unsupported, and 125/500/1000 Hz each round-tripped
   // on the legacy one.
   [0x00b8, { model: "Viper V3 HyperSpeed", wireless: true, maxDpi: 30000, transactionId: RAZER_TRANSACTION_ID, rates: RATES_1K, highRate: false }],
+  // Mouse Dock Pro with a Naga V2 Pro paired: settings passthrough on `0x1f`,
+  // and polling rates discovered from which command the paired mouse answers.
+  [0x00a4, { model: "Mouse Dock Pro", wireless: true, maxDpi: 30000, transactionId: RAZER_TRANSACTION_ID, rates: RATES_1K, highRate: true }],
+  // Naga V2 Pro (firmware 1.3): fixed 1 kHz ladder on cable and stock receiver;
+  // also the paired mouse used to verify Dock Pro passthrough.
+  [0x00a7, { model: "Naga V2 Pro (Wired)", wireless: false, maxDpi: 30000, transactionId: RAZER_TRANSACTION_ID, rates: RATES_1K, highRate: false }],
+  [0x00a8, { model: "Naga V2 Pro", wireless: true, maxDpi: 30000, transactionId: RAZER_TRANSACTION_ID, rates: RATES_1K, highRate: true }],
+  // DeathAdder V3 Pro (firmware 2.1) on the stock HyperSpeed receiver: the
+  // legacy polling command changes the measured report rate (124 Hz at 125,
+  // 842 Hz peak at 1000), and DPI, auto sleep and low power all persisted
+  // across a reconnect and a power cycle.
+  [0x00b7, { model: "DeathAdder V3 Pro", wireless: true, maxDpi: 30000, transactionId: RAZER_TRANSACTION_ID, rates: RATES_1K, highRate: false }],
+  // Same mouse over the cable, same session: 13/13 writes persisted, 126 Hz
+  // peak measured at 125, battery reports "Charging".
+  [0x00b6, { model: "DeathAdder V3 Pro (Wired)", wireless: false, maxDpi: 30000, transactionId: RAZER_TRANSACTION_ID, rates: RATES_1K, highRate: false }],
+  // Diamondback Chroma (firmware 1.0) over the cable through OpenMouse Bridge:
+  // answers on `0xff`, and DPI and legacy polling each round-tripped.
+  [0x004c, { model: "Diamondback Chroma", wireless: false, maxDpi: 16000, transactionId: RAZER_TRANSACTION_ID_FF, rates: RATES_1K, highRate: false }],
 ];
 
 const VERIFIED = [...REFACTOR_BASELINE, ...VERIFIED_SINCE];
@@ -62,7 +80,7 @@ const VERIFIED = [...REFACTOR_BASELINE, ...VERIFIED_SINCE];
  * hardware-tested", so it is pinned like the others without claiming to be
  * verified.
  */
-const HARDWARE_VERIFIED: readonly number[] = [0x00a5, 0x00a6, 0x00c0, 0x00c1, 0x00b8];
+const HARDWARE_VERIFIED: readonly number[] = [0x00a4, 0x00a5, 0x00a6, 0x00a7, 0x00a8, 0x00c0, 0x00c1, 0x00b8, 0x00b7, 0x00b6, 0x004c];
 
 test("every pinned product keeps exactly the profile it was given", () => {
   // A silent change to any of these would only show up on hardware, which is
@@ -118,6 +136,79 @@ test("the DeathAdder V3 Pro receiver writes polling on the legacy command", () =
   for (const rate of receiver?.pollingRates ?? []) {
     assert.doesNotThrow(() => razerSetLegacyPollingCommand(rate));
   }
+});
+
+test("the wired DeathAdder V3 writes polling on the extended command", () => {
+  // Reported on hardware: the legacy read `00/85` answered with status 0x05
+  // (not supported) and the extended read `00/c0` answered 8000/4, so the mouse
+  // was running at 2000 Hz while this row still capped the picker at 1000.
+  const wired = RAZER_PRODUCTS.get(0x00b2);
+  assert.equal(wired?.wireless, false);
+  assert.equal(wired?.highRatePolling, true);
+  // Both writes stay on 0x1f. The dongle's commit uses 0xff; copying that
+  // here would address a transaction this mouse does not use for the commit.
+  assert.equal(wired?.extendedPollingCommitTransactionId, RAZER_TRANSACTION_ID);
+  // The rate the hardware was found at has to survive the round trip, or the
+  // picker offers a value the mouse is already sitting at and cannot be set to.
+  assert.ok(wired?.pollingRates.includes(2000));
+  for (const rate of wired?.pollingRates ?? []) {
+    assert.doesNotThrow(() => razerSetExtendedPollingCommand(rate));
+  }
+});
+
+test("the wireless Viper V3 Pro commits polling with selector 0x01", () => {
+  // Issue #228: the extended write applied live but the rate reverted after the
+  // mouse powered off. OpenRazer sends a second selector-`0x01` write on `0x1f`
+  // for `VIPER_V3_PRO_WIRELESS`; the wired id is not in that list and keeps the
+  // single write.
+  const wireless = RAZER_PRODUCTS.get(0x00c1);
+  assert.equal(wireless?.highRatePolling, true);
+  assert.equal(wireless?.extendedPollingCommitTransactionId, RAZER_TRANSACTION_ID);
+  assert.equal(RAZER_PRODUCTS.get(0x00c0)?.extendedPollingCommitTransactionId, undefined);
+});
+
+test("the standalone HyperPolling dongle exposes 8 kHz and its two-step commit", () => {
+  const dongle = RAZER_PRODUCTS.get(0x00b3);
+  assert.equal(dongle?.model, "HyperPolling Wireless Dongle");
+  assert.equal(dongle?.wireless, true);
+  assert.equal(dongle?.highRatePolling, true);
+  assert.deepEqual([...dongle?.pollingRates ?? []], [...RATES_8K]);
+  assert.equal(dongle?.transactionId, RAZER_TRANSACTION_ID);
+  assert.equal(dongle?.extendedPollingCommitTransactionId, RAZER_TRANSACTION_ID_FF);
+});
+
+test("the Viper V3 Pro SE pair matches the reference without inheriting the V3 Pro's evidence", () => {
+  const wired = RAZER_PRODUCTS.get(0x00de);
+  const wireless = RAZER_PRODUCTS.get(0x00df);
+
+  // The SE is a protocol variant, so it shares the V3 Pro's transport, sensor
+  // ceiling and transaction id.
+  for (const product of [wired, wireless]) {
+    assert.equal(product?.transport, "viper-receiver");
+    assert.equal(product?.maxDpi, 35_000);
+    assert.equal(product?.hasBattery, true);
+    // Neither has been connected, so neither may claim the V3 Pro's flags: the
+    // lift-off read cannot distinguish "no feature" from "Low", and `verified`
+    // gates the "untested model" label and the strict battery read.
+    assert.equal(product?.verified, false);
+    assert.equal(product?.liftOff, false);
+    assert.equal(product?.asymmetricLiftOff, false);
+  }
+
+  // Both rows are on the legacy polling command. The wired one always was; the
+  // wireless one started on the 8 kHz ladder from OpenRazer's SE class until a
+  // capture on the stock HyperSpeed receiver answered the extended read with
+  // status 0x05 (not supported) and the legacy read with a divisor of 1.
+  //
+  // Do not restore RATES_8K here from the reference. The 8 kHz ceiling belongs
+  // to the HyperPolling dongle, which is a different receiver and a different
+  // product id.
+  assert.deepEqual([...wired?.pollingRates ?? []], [...RATES_1K]);
+  assert.deepEqual([...wireless?.pollingRates ?? []], [...RATES_1K]);
+  assert.equal(wired?.wireless, false);
+  assert.equal(wireless?.wireless, true);
+  assert.equal(wired?.highRatePolling, false);
+  assert.equal(wireless?.highRatePolling, false);
 });
 
 test("no product asks for a rate its polling command cannot encode", () => {
@@ -181,6 +272,37 @@ test("the asymmetric lift-off write probe is only armed where it was confirmed",
   for (const id of armed) assert.equal(RAZER_PRODUCTS.get(id)?.verified, true);
 });
 
+test("button mapping is only offered on connections where class 0x02 answered", () => {
+  // Gated per product id and per connection, not per model. An all-zero reply
+  // decodes as "Disabled" on every control, so a transport that does not
+  // implement class 0x02 does not fail loudly — it produces a full, plausible
+  // set of controls that all read Disabled and silently do nothing. Hence an
+  // allowlist, and hence a hardware run per entry even for two connections of
+  // the same mouse.
+  const offered = RAZER_PRODUCT_IDS.filter((id) => RAZER_PRODUCTS.get(id)?.buttonMapping === true);
+  assert.deepEqual(offered.sort(), [0x00c0, 0x00c1]);
+  for (const id of offered) {
+    assert.equal(RAZER_PRODUCTS.get(id)?.verified, true, `0x${id.toString(16)} offers button mapping without being verified`);
+  }
+});
+
+test("extended-matrix lighting is offered on the Basilisk V3 pair OpenRazer drives that way", () => {
+  // Untested on hardware: a reporter with the mouse connected and asked for
+  // the lighting, which is the only way an effect write without a read-back
+  // ever gets checked. Each id here needs its owner to watch the LEDs.
+  const offered = RAZER_PRODUCT_IDS.filter((id) => RAZER_PRODUCTS.get(id)?.extendedMatrixLighting === true);
+  assert.deepEqual(offered, [0x0099, 0x00cb]);
+  for (const id of offered) assert.notEqual(RAZER_PRODUCTS.get(id)?.standardMatrixLighting, true);
+});
+
+test("standard-matrix lighting is only offered on a model someone is testing it on", () => {
+  // Effect writes have no read-back, so a mouse that ignores them looks the
+  // same as one that obeys. Every entry needs its owner to watch the LEDs.
+  const offered = RAZER_PRODUCT_IDS.filter((id) => RAZER_PRODUCTS.get(id)?.standardMatrixLighting === true);
+  assert.deepEqual(offered, [0x004c]);
+  for (const id of offered) assert.equal(RAZER_PRODUCTS.get(id)?.verified, true);
+});
+
 test("no product is claimed by both this registry and a dedicated Razer driver", () => {
   // `driverFor` returns the first match in DEVICE_DRIVERS, so an overlap would
   // silently kill whichever driver is registered later.
@@ -193,10 +315,8 @@ test("no product is claimed by both this registry and a dedicated Razer driver",
 
 test("families that cannot work over this transport are left out", () => {
   // Orochi 2011 and the two DeathAdder 3.5G ids predate the 90-byte report and
-  // need direct USB control writes; 0x0095 is a Bluetooth path, and 0x00b3 is a
-  // dongle rather than a mouse. Listing any of them would produce a device that
-  // connects and then times out.
-  for (const productId of [0x0013, 0x0016, 0x0029, 0x0095, 0x00b3]) {
+  // need direct USB control writes, while 0x0095 is a Bluetooth path.
+  for (const productId of [0x0013, 0x0016, 0x0029, 0x0095]) {
     assert.equal(RAZER_PRODUCTS.has(productId), false, `0x${productId.toString(16)} cannot be driven by this transport`);
   }
 });
@@ -236,9 +356,15 @@ const OPENRAZER_TRANSACTION_IDS: ReadonlyMap<number, number> = new Map([
     0x0062, 0x006c, 0x0077, 0x0080, 0x0085, 0x0086, 0x0088, 0x008d, 0x008f,
     0x0090, 0x0094, 0x0096, 0x0099, 0x009a, 0x009c, 0x009e, 0x009f, 0x00a1,
     0x00a5, 0x00a6, 0x00a7, 0x00a8, 0x00aa, 0x00ab, 0x00af, 0x00b0, 0x00b2,
-    0x00b4, 0x00b6, 0x00b7, 0x00b8, 0x00b9, 0x00be, 0x00bf, 0x00c0, 0x00c1,
+    0x00b3, 0x00b4, 0x00b6, 0x00b7, 0x00b8, 0x00b9, 0x00be, 0x00bf, 0x00c0, 0x00c1,
     0x00c2, 0x00c3, 0x00c4, 0x00c5, 0x00c7, 0x00c8, 0x00cb, 0x00cc, 0x00cd,
     0x00d0, 0x00d1, 0x00d3, 0x00d4, 0x00d6, 0x00d7,
+    // Viper V3 Pro SE. Read from PR #2818 rather than the merged driver: its
+    // classes subclass the Viper V3 Pro ones, and the transaction id is a class
+    // property, so the SE inherits `0x1f` from `0x00c0`/`0x00c1` at the source.
+    // Not a divergence — but a pending PR is weaker provenance than the rest of
+    // this table, and still no substitute for connecting one.
+    0x00de, 0x00df,
   ].map((id) => [id, 0x1f] as const),
 ]);
 
@@ -249,6 +375,15 @@ const EXPECTED_DIVERGENCE: ReadonlyMap<number, { ours: number; openRazer: number
   [0x006e, { ours: 0x3f, openRazer: 0xff, why: "predates the audit; untested either way" }],
   [0x0071, { ours: 0x3f, openRazer: 0xff, why: "predates the audit; untested either way" }],
   [0x0098, { ours: 0x3f, openRazer: 0xff, why: "predates the audit; untested either way" }],
+  // Not a mouse in OpenRazer's table; the dock answers on the paired mouse's
+  // generation id. Confirmed with a Naga V2 Pro.
+  [0x00a4, { ours: 0x1f, openRazer: 0xff, why: "hardware report with Naga V2 Pro: dock answers on 0x1f" }],
+  // DeathAdder V4 Pro Carbon Fiber Edition: not in OpenRazer's table at all
+  // yet (a cosmetic SKU, likely too new), so the audit map has no entry and
+  // the fallback would be 0xff. Assumed to share 0x00be/0x00bf's 0x1f as the
+  // same electronics under a different shell — unverified either way.
+  [0x00ef, { ours: 0x1f, openRazer: 0xff, why: "not yet in OpenRazer; assumed same generation as 0x00be" }],
+  [0x00f0, { ours: 0x1f, openRazer: 0xff, why: "not yet in OpenRazer; assumed same generation as 0x00bf" }],
 ]);
 
 test("every transaction id matches OpenRazer, or is a divergence with a reason", () => {
@@ -322,6 +457,28 @@ test("only wireless-capable models are sent battery commands", () => {
   }
 });
 
+test("Mouse Dock Pro discovers the paired mouse's polling ladder", () => {
+  const dock = RAZER_PRODUCTS.get(0x00a4);
+  assert.ok(dock);
+  assert.equal(dock.probePollingRates, true);
+  assert.equal(dock.connectionLabel, "Mouse Dock Pro");
+  assert.equal(dock.verified, true);
+  // Pre-probe defaults only; the driver replaces both after the first read.
+  assert.deepEqual([...dock.pollingRates], [...RATES_1K]);
+  assert.equal(dock.highRatePolling, true);
+});
+
+test("Naga V2 Pro is hardware-verified on cable and stock receiver", () => {
+  const wired = RAZER_PRODUCTS.get(0x00a7);
+  const receiver = RAZER_PRODUCTS.get(0x00a8);
+  assert.equal(wired?.verified, true);
+  assert.equal(receiver?.verified, true);
+  assert.deepEqual([...(wired?.pollingRates ?? [])], [...RATES_1K]);
+  assert.deepEqual([...(receiver?.pollingRates ?? [])], [...RATES_1K]);
+  assert.equal(wired?.highRatePolling, false);
+  assert.equal(receiver?.highRatePolling, true);
+});
+
 test("the picker filter list covers every product in the registry", () => {
   // Built from the same map, so this guards the wiring rather than the data:
   // an id in the registry with no filter can never reach the driver.
@@ -336,7 +493,7 @@ test("the catch-all filter does not widen a filter that was deliberately narrowe
   const { RAZER_REGISTRY_FILTERS, SUPPORTED_HID_FILTERS, VENDOR_ID } = await import("../vendors.ts");
 
   const broad = new Set(RAZER_REGISTRY_FILTERS.map((filter) => filter.productId));
-  for (const productId of [0x00a5, 0x00a6, 0x00c0, 0x00c1, 0x006e, 0x0071, 0x0098]) {
+  for (const productId of [0x00a4, 0x00a5, 0x00a6, 0x00c0, 0x00c1, 0x006e, 0x0071, 0x0098]) {
     assert.equal(broad.has(productId), false, `0x${productId.toString(16)} is filtered twice`);
   }
   // Every registry id still reaches the picker, through one filter or another.
