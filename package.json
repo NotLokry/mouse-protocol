@@ -98,6 +98,7 @@
     "prepare": "npm run build"
   },
   "devDependencies": {
+    "@types/node": "^26.2.0",
     "tsx": "^4.23.11",
     "typescript": "^5.8.3"
   },
