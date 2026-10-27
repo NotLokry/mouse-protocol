@@ -236,6 +236,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
+    "semantic-release": "25.0.9",
     "tsx": "^4.23.11",
     "typescript": "^5.8.3"
   },
